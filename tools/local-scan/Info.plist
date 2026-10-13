@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleExecutable</key>
+  <string>local-scan</string>
+  <key>CFBundleIdentifier</key>
+  <string>local.aieverything.localscan</string>
+  <key>CFBundleName</key>
+  <string>AIE Local Scan</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>14.0</string>
+  <key>LSUIElement</key>
+  <true/>
+  <key>NSSpeechRecognitionUsageDescription</key>
+  <string>AI Everything 在本机识别音轨内容，用于搜索音频文件。</string>
+</dict>
+</plist>
