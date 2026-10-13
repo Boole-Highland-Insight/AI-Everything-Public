@@ -38,5 +38,5 @@ GUIDE
 AIE_DMG="$AIE_OUTPUT/AI-Everything-$AIE_RELEASE-$AIE_ARCH_VALUE.dmg"
 hdiutil create -volname 'AI Everything' -srcfolder "$AIE_STAGE" -ov -format UDZO -fs HFS+ "$AIE_DMG"
 hdiutil verify "$AIE_DMG"
-(cd "$AIE_OUTPUT" && shasum -a 256 "$(basename "$AIE_DMG")" > SHA256SUMS)
+(cd "$AIE_OUTPUT" && LC_ALL=C shasum -a 256 "$(basename "$AIE_DMG")" > SHA256SUMS)
 echo "未公证预览版：$AIE_DMG"
