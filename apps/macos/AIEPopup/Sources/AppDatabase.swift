@@ -8,7 +8,7 @@ enum AppDatabase {
     private static var error: String?
     static var url: URL {
         if let path = ProcessInfo.processInfo.environment["AIE_DATABASE_PATH"], !path.isEmpty { return URL(fileURLWithPath: path) }
-        return FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("AI Everything/Index/content.sqlite")
+        return AIEApplicationPaths.support.appendingPathComponent("Index/content.sqlite")
     }
     static var lastError: String? { lock.lock(); defer { lock.unlock() }; return error }
     static func failed(_ failure: Error) {
@@ -16,11 +16,16 @@ enum AppDatabase {
         AppLog.write("database: \(failure)")
         if ProcessInfo.processInfo.environment["AIE_DATABASE_PATH"] != nil { fputs(String(describing: failure) + "\n", stderr) }
     }
-    static func open() throws -> ContentStore {
+    static func open(readOnly: Bool = false) throws -> ContentStore {
         lock.lock(); defer { lock.unlock() }
-        if let storage { return storage }
-        let db = try ContentStore(path: url.path)
-        if ProcessInfo.processInfo.environment["AIE_DATABASE_PATH"] == nil {
+        if let storage {
+            guard !readOnly || storage.isReadOnly else {
+                throw DataLayerError.invalidDocument("Read-only evaluation cannot reuse a writable database connection")
+            }
+            return storage
+        }
+        let db = try ContentStore(path: url.path, readOnly: readOnly)
+        if !readOnly && ProcessInfo.processInfo.environment["AIE_DATABASE_PATH"] == nil {
             try db.recoverInterruptedJobs()
             try db.importPreferences(["kept": UserDefaults.standard.stringArray(forKey: "aie.recycleKept") ?? [],
                                       "deferred": UserDefaults.standard.stringArray(forKey: "aie.scan.deferredPaths") ?? []])

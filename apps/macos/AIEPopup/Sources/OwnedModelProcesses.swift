@@ -5,8 +5,13 @@ enum OwnedModelProcesses {
     private static let lock = NSLock()
     private static var processes: [Process] = []
     private static var stopping = false
+    private static let exitHandlerInstalled: Bool = {
+        atexit { OwnedModelProcesses.stop() }
+        return true
+    }()
 
     static func run(_ process: Process) throws {
+        _ = exitHandlerInstalled
         lock.lock()
         defer { lock.unlock() }
         guard !stopping else { throw CancellationError() }

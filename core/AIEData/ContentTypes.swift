@@ -147,16 +147,26 @@ public struct ChunkResult: Codable, Sendable {
     public let summary: String
     public let tags: [String]
     public let score: Double
+    public let retrievalChannel: String?
 
     public init(contentHash: String, id: String, fileID: String, versionID: String,
                 path: String, relativePath: String, kind: String, page: Int?,
                 startSeconds: Double?, endSeconds: Double?, locationJSON: String?,
-                text: String, summary: String, tags: [String], score: Double) {
+                text: String, summary: String, tags: [String], score: Double,
+                retrievalChannel: String? = nil) {
         self.contentHash = contentHash; self.id = id; self.fileID = fileID
         self.versionID = versionID; self.path = path; self.relativePath = relativePath
         self.kind = kind; self.page = page; self.startSeconds = startSeconds
         self.endSeconds = endSeconds; self.locationJSON = locationJSON; self.text = text
         self.summary = summary; self.tags = tags; self.score = score
+        self.retrievalChannel = retrievalChannel
+    }
+
+    public func from(_ channel: String) -> ChunkResult {
+        ChunkResult(contentHash: contentHash, id: id, fileID: fileID, versionID: versionID,
+                    path: path, relativePath: relativePath, kind: kind, page: page,
+                    startSeconds: startSeconds, endSeconds: endSeconds, locationJSON: locationJSON,
+                    text: text, summary: summary, tags: tags, score: score, retrievalChannel: channel)
     }
 
     public func withScore(_ score: Double) -> ChunkResult {

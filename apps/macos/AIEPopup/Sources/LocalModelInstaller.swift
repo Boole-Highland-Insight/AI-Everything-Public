@@ -32,18 +32,16 @@ enum LocalModelInstaller {
         }
     }
 
-    private static let endpoint = URL(string: "http://127.0.0.1:11435")!
+    private static let endpoint = URL(string: "http://" + AIEApplicationPaths.ollamaHost)!
     private static let lock = NSLock()
     private static var server: Process?
 
     private static var semanticHome: URL {
-        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("AI Everything/Semantic")
+        AIEApplicationPaths.support.appendingPathComponent("Semantic")
     }
     private static var runtime: URL { semanticHome.appendingPathComponent("bin/ollama") }
     static var logURL: URL {
-        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("AI Everything/model-install.log")
+        AIEApplicationPaths.support.appendingPathComponent("model-install.log")
     }
 
     private static let session: URLSession = {
@@ -141,7 +139,7 @@ enum LocalModelInstaller {
         var environment = ProcessInfo.processInfo.environment
         // The script only installs the runtime here; models are downloaded natively below so the
         // whole setup no longer needs python3, which is absent until Command Line Tools exist.
-        environment["AIE_SKIP_MODEL_PULL"] = "1"
+        environment["AIE_SEMANTIC_HOME"] = semanticHome.path
         environment["LC_ALL"] = "C"
         environment.removeValue(forKey: "OPENROUTER_API_KEY")
         process.environment = environment
@@ -178,7 +176,7 @@ enum LocalModelInstaller {
         child.executableURL = runtime
         child.arguments = ["serve"]
         var environment = ProcessInfo.processInfo.environment
-        environment["OLLAMA_HOST"] = "127.0.0.1:11435"
+        environment["OLLAMA_HOST"] = AIEApplicationPaths.ollamaHost
         environment["OLLAMA_MODELS"] = LocalModelLibrary.privateModels.path
         environment["OLLAMA_NO_CLOUD"] = "1"
         environment["OLLAMA_NUM_PARALLEL"] = "1"

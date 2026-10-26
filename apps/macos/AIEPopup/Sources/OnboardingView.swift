@@ -140,8 +140,19 @@ struct OnboardingView: View {
         VStack(alignment: .leading, spacing: 14) {
             pageTitle(
                 "选择扫描方案",
-                detail: "三档均包含 0.6B 语义索引；后两档加入内容理解模型。"
+                detail: "Gemma 负责文字与视觉索引；本地 8B 可在后台补充内容理解。"
             )
+            if AIEApplicationPaths.isCleanV2 {
+                Toggle("开启后台深度理解（本地 8B）", isOn: Binding(
+                    get: { setup.selectedPlan == .deep },
+                    set: { setup.selectedPlan = $0 ? .deep : .semantic }
+                ))
+                .toggleStyle(.checkbox)
+                Text("可取消；Gemma、全文索引和 OCR 仍可使用。首次使用默认开启，之后保留你的选择。")
+                    .font(.system(size: 12)).foregroundStyle(.secondary)
+                Text(setup.selectedPlanInstalled ? "所选模型已安装" : "继续后安装所选模型")
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
+            } else {
             ForEach(LocalScanPlan.allCases) { plan in
                 Button {
                     setup.selectedPlan = plan
@@ -189,6 +200,7 @@ struct OnboardingView: View {
                 }
                 .buttonStyle(.plain)
                 .disabled(setup.installing)
+            }
             }
             installStatus
             if setup.selectedPlan == .deep, setup.profile?.appleSilicon == false {
@@ -299,7 +311,7 @@ struct OnboardingView: View {
             VStack(alignment: .leading, spacing: 7) {
                 Text("填写后可使用：").font(.system(size: 12, weight: .medium))
                 Label("Jev 自动整理：搜索时判断候选是否真正相关", systemImage: "scope")
-                Label("精搜：需要时扩大范围，再由 Jev 判断更多候选", systemImage: "magnifyingglass.circle")
+                Label("候选整理：自动扩大范围，再由 Jev 判断可能结果", systemImage: "magnifyingglass.circle")
                 Label("咔哒：对你选中的文件生成新版本或补全内容", systemImage: "sparkles")
             }
             .font(.system(size: 12))
@@ -325,7 +337,7 @@ struct OnboardingView: View {
                 usageRow("输入", "文件名、关键词，或用一句话描述要找的内容")
                 usageRow("↑ ↓ 选择 · ↩ 打开", "选中结果后打开；PDF 和视频优先定位到命中位置")
                 usageRow("空格 · ⌘ ↩", "查看选中内容 · 在访达中显示原文件")
-                usageRow("输入框内 ↩", "确认当前搜索；Jev 会自动整理，仍想扩大范围可点精搜")
+                usageRow("输入框内 ↩", "确认当前搜索；可能结果会继续补充，并由 Jev 自动整理")
                 usageRow("Esc", "收起搜索；点击菜单栏 AIE 可再次打开")
             }
             Divider()
@@ -496,7 +508,7 @@ struct OnboardingView: View {
     }
 
     private func planRows(_ plan: LocalScanPlan) -> [String] {
-        var rows = ["语义搜索：Qwen3 Embedding 0.6B"]
+        var rows = ["语义搜索：EmbeddingGemma 2（文字与视觉）"]
         if let vision = plan.visionModel {
             rows.append("内容理解：\(LocalQuickScan.displayName(for: vision))")
         }
@@ -507,7 +519,7 @@ struct OnboardingView: View {
         if setup.modelsAvailable(for: plan) { return "已安装" }
         switch plan {
         case .semantic:
-            return "需安装 0.6B"
+            return "需安装 Gemma"
         case .balanced:
             return "下载约 \(downloadSize(4)) GB"
         case .deep:

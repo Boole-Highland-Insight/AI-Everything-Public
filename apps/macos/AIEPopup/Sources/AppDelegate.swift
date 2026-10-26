@@ -21,27 +21,46 @@ private func aieHotKeyCallback(
 @main
 enum AIEMain {
     static func main() {
-        if LibraryRoots.runIfRequested()
+        AIEApplicationPaths.configure()
+        if Bundle.main.object(forInfoDictionaryKey: "AIEAuditOnly") as? Bool == true {
+            let path = ProcessInfo.processInfo.environment["AIE_DATABASE_PATH"].map {
+                URL(fileURLWithPath: $0).resolvingSymlinksInPath().path
+            } ?? ""
+            guard path.hasPrefix("/private/tmp/") || path.hasPrefix("/tmp/"),
+                  CommandLine.arguments.contains("--benchmark-search-ui")
+                    || CommandLine.arguments.contains("--audit-index-samples") else {
+                fputs("Audit bundle requires an isolated temporary database and an audit command.\n", stderr)
+                exit(2)
+            }
+        }
+        if DeepUnderstandingDiagnostics.runIfRequested() || LibraryRoots.runIfRequested()
             || OnboardingDemoExport.runIfRequested()
             || IndexingStatusDiagnostics.runIfRequested()
             || OnboardingDiagnostics.runIfRequested() || ModelDetectionDiagnostics.runIfRequested()
             || PhotoImportDiagnostics.runIfRequested() || LocalQuickScanDiagnostics.runIfRequested()
             || SearchAuditDiagnostics.runIfRequested() || SearchEvaluationDiagnostics.runIfRequested()
-            || SemanticDiagnostics.runIfRequested() || VectorIndexDiagnostics.runIfRequested()
+            || SemanticDiagnostics.runIfRequested() || GemmaDiagnostics.runIfRequested()
+            || GemmaProductEvaluation.runIfRequested()
+            || GemmaTextEvaluation.runIfRequested()
+            || VectorIndexDiagnostics.runIfRequested()
             || StorageDiagnostics.runIfRequested() || JunkClassifierDiagnostics.runIfRequested()
             || ReusePPTXDiagnostics.runIfRequested() || AITabDiagnostics.runIfRequested()
             || ScanPolicy.runIfRequested() || MediaDiagnostics.runIfRequested()
             || IndexDiagnostics.runIfRequested() { return }
         AppLog.write("main-entered")
-        let app = NSApplication.shared
-        AppLog.write("got-app")
-        let delegate = AppDelegate.shared
-        AppLog.write("got-delegate")
-        app.delegate = delegate
-        app.setActivationPolicy(.accessory)
-        delegate.start()
-        AppLog.write("start-returned")
-        app.run()
+        let startup = ArchitectureAuditTrace.begin("app_main_setup")
+        ArchitectureAuditTrace.$traceID.withValue(startup?.trace) {
+            let app = NSApplication.shared
+            AppLog.write("got-app")
+            let delegate = AppDelegate.shared
+            AppLog.write("got-delegate")
+            app.delegate = delegate
+            app.setActivationPolicy(.accessory)
+            delegate.start()
+            AppLog.write("start-returned")
+            startup?.end()
+        }
+        NSApplication.shared.run()
     }
 }
 
@@ -118,7 +137,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem?
     private var panel: NSWindow?
     private var scanWindow: NSWindow?
-    private var settingsWindow: NSWindow?
     private var reuseWindow: NSWindow?
     private var model = SearchModel()
     private var cancellables = Set<AnyCancellable>()
@@ -217,8 +235,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         )
         folders.target = self
         appMenu.addItem(folders)
-        let settings = appMenu.addItem(withTitle: "设置…", action: #selector(showSettings), keyEquivalent: ",")
-        settings.target = self
         let tutorial = appMenu.addItem(withTitle: "重新打开新手引导…", action: #selector(showOnboarding), keyEquivalent: "")
         tutorial.target = self
         appMenu.addItem(NSMenuItem.separator())
@@ -263,7 +279,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(withTitle: ScanControl.shared.isPaused ? "继续扫描" : "暂停扫描",
                      action: #selector(toggleScanning), keyEquivalent: "").target = self
         menu.addItem(.separator())
-        menu.addItem(withTitle: "设置…", action: #selector(showSettings), keyEquivalent: ",").target = self
         menu.addItem(withTitle: "重新打开新手引导…", action: #selector(showOnboarding), keyEquivalent: "").target = self
         menu.addItem(.separator())
         menu.addItem(withTitle: "退出 AI Everything", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
@@ -275,24 +290,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func toggleScanning() { model.toggleScanning() }
 
-    @MainActor @objc func showSettings() {
-        guard !configurationWindowBlocking else { DeviceSetup.shared.bringToFront(); return }
-        hidePanel()
-        if settingsWindow == nil {
-            let window = NSWindow(contentViewController: NSHostingController(rootView: APISettingsView(model: model)))
-            window.title = "AI Everything 设置"
-            window.styleMask = [.titled, .closable, .miniaturizable]
-            window.setContentSize(NSSize(width: 430, height: 600))
-            window.isReleasedWhenClosed = false
-            window.center()
-            settingsWindow = window
-        }
-        if let settingsWindow { AppWindowPresence.shared.show(settingsWindow) }
-    }
-
     @MainActor @objc func showOnboarding() {
         hidePanel()
-        AppWindowPresence.shared.hide(settingsWindow)
         configurationWindowBlocking = true
         DeviceSetup.shared.presentGuide(
             configure: { [weak self] urls in self?.model.configureInitialSources(urls) },

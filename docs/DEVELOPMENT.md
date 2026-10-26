@@ -1,6 +1,6 @@
 # 开发与验证
 
-需要 macOS 14+、Swift 6.1+ 和 macOS SDK（Xcode 或 Command Line Tools）。
+需要 macOS 14+、Swift 6.1+、CMake 和 macOS SDK（Xcode 或 Command Line Tools）。
 
 ## 构建
 
@@ -9,7 +9,7 @@ bash apps/macos/AIEPopup/build.sh
 open "apps/macos/AIEPopup/build/AI Everything.app"
 ```
 
-首次构建下载锁定的 GRDB 7.11.1，后续复用 `apps/macos/AIEPopup/build/` 缓存。构建脚本只打包运行资源，不复制用户 Application Support。Release 会映射源路径并剥离调试符号，避免附带本机构建路径。
+首次构建下载锁定的 GRDB 7.11.1，并从官方 `ggml-org/llama.cpp` 的固定提交编译 Gemma 运行时。Gemma 2 Q8_0 文字模型和 mmproj 从官方 `ggml-org/embeddinggemma-2-GGUF` 下载、校验 SHA256 后随 App 打包。若本机 AIE 的 `~/Library/Application Support/AI Everything/Semantic/models` 已有校验通过的文件，会直接复用；构建和运行均不依赖 DigUp。可用 `AIE_GEMMA_MODELS_SOURCE`、`AIE_LLAMA_CPP_SOURCE` 和 `AIE_CMAKE_PATH` 指定构建输入。完整 App 约 859 MB。Release 会映射源路径并剥离调试符号，避免附带本机构建路径。
 
 默认构建当前架构。Intel 交叉编译：
 
@@ -50,10 +50,10 @@ xcrun swiftc -parse-as-library tools/make_onboarding_demo.swift -o /tmp/aie-demo
 
 ## 打包
 
-明确标记的未公证 GitHub 预览版 DMG：
+明确标记的未公证 GitHub DMG：
 
 ```sh
-AIE_RELEASE=0.1.0-preview.1 bash tools/package_macos_preview.sh
+AIE_RELEASE=0.1.0 bash tools/package_macos_preview.sh
 ```
 
 输出位于 `apps/macos/AIEPopup/build/releases/`，包含 DMG 和 `SHA256SUMS`。此流程使用 ad-hoc 签名，不经过 Apple 公证，必须在下载说明中告知用户。

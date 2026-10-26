@@ -10,8 +10,7 @@ enum LocalModelLibrary {
     }
 
     static var privateModels: URL {
-        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("AI Everything/Semantic/models")
+        AIEApplicationPaths.support.appendingPathComponent("Semantic/models")
     }
 
     /// Model stores that belong to other Ollama installations, newest conventions first.

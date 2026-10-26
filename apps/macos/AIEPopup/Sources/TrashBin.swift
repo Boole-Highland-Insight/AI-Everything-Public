@@ -29,6 +29,7 @@ enum TrashBin {
     private static let fm = FileManager.default
     private static var root: URL {
         if let path = ProcessInfo.processInfo.environment["AIE_TRASH_PATH"] { return URL(fileURLWithPath: path) }
+        if AIEApplicationPaths.isCleanV2 { return AIEApplicationPaths.support.appendingPathComponent("Trash") }
         return fm.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/AI Everything/Trash")
     }
     private static var filesRoot: URL { root.appendingPathComponent("files") }
@@ -117,7 +118,7 @@ enum TrashBin {
         do {
             let db = try database(roots: ProcessInfo.processInfo.environment["AIE_TRASH_PATH"] == nil ? LibraryRoots.load() : [])
             try recover(db)
-            try sweepExpired(db)
+            if !AIEApplicationPaths.isCleanV2 { try sweepExpired(db) }
             return try db.trashRecords().filter { $0.state == "trashed" || $0.state == "moving" || $0.state == "restoring" }.compactMap { rec in
                 let stored = try checkedStored(rec)
                 guard fm.fileExists(atPath: stored.path) else { return nil }

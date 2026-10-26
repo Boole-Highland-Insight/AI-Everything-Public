@@ -25,6 +25,7 @@ final class ScanProgress: ObservableObject {
     @Published var running = false
     @Published var localScanned = 0
     @Published var localRemaining = 0
+    @Published var llmInventoryReady = false
     @Published var llmScanned = 0
     @Published var llmRemaining = 0
     @Published var localFailed = 0
@@ -46,6 +47,8 @@ final class ScanProgress: ObservableObject {
     @Published var yieldingForSearch = false
     @Published var llmUsesLocalModel = false
     @Published var indexing = false
+    @Published var catalogDiscovering = false
+    @Published var indexGeneration = 0
     @Published var indexFailed = false
     @Published var indexedFiles = 0
     @Published var indexTotal = 0
@@ -107,7 +110,13 @@ final class ScanProgress: ObservableObject {
         catalogCount = count
     }
 
+    func beginDiscovery() {
+        indexGeneration += 1
+        catalogDiscovering = true
+    }
+
     func beginIndexing(total: Int) {
+        catalogDiscovering = false
         indexing = total > 0
         indexFailed = false
         indexedFiles = 0
@@ -116,13 +125,14 @@ final class ScanProgress: ObservableObject {
     }
 
     func updateIndexing(completed: Int, total: Int) {
-        indexing = completed < total
+        indexing = total > 0 // The pass ends only at finishIndexing, not at the last batch callback.
         indexedFiles = min(max(0, completed), total)
         indexTotal = total
         if indexing { message = "内容索引 \(indexedFiles)/\(indexTotal)" }
     }
 
     func finishIndexing(completed: Bool) {
+        catalogDiscovering = false
         if completed { indexedFiles = indexTotal }
         indexing = false
         indexFailed = !completed
@@ -149,6 +159,16 @@ final class ScanProgress: ObservableObject {
         }
         message = "当前文件处理完成后已暂停；继续时会从队列恢复。"
         showDone = true
+    }
+
+    func pauseDeepUnderstanding() {
+        guard active == .llm else { return }
+        ScanRecovery.markPaused(.llm)
+        running = false
+        active = .none
+        currentFile = nil
+        yieldingForSearch = false
+        message = "后台深度理解已停止安排新任务；已有结果已保存。"
     }
 
     func resumeByUser() {
@@ -207,6 +227,7 @@ final class ScanProgress: ObservableObject {
         yieldingForSearch = false
         showDone = false
         active = .llm
+        llmInventoryReady = true
         llmUsesLocalModel = usesLocalModel
         recoveredInterruption = recovered != nil && remaining > 0
         cloudPaused = false

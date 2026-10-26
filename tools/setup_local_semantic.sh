@@ -1,5 +1,5 @@
 #!/bin/bash
-# Installs a dedicated, loopback-only embedding runtime. Does not scan or upload files.
+# Installs a dedicated, loopback-only background vision runtime. Does not scan or upload files.
 set -euo pipefail
 AIE_SEMANTIC_HOME="${AIE_SEMANTIC_HOME:-$HOME/Library/Application Support/AI Everything/Semantic}"
 AIE_VERSION=0.33.3
@@ -43,21 +43,5 @@ rm -rf "$AIE_SEMANTIC_HOME/bin.previous"
 chmod 700 "$AIE_SEMANTIC_HOME/bin"
 printf '%s' "$AIE_VERSION" > "$AIE_SEMANTIC_HOME/runtime-version"
 fi
-# The app downloads models itself so setup works on Macs without Command Line Tools (no python3).
-if [ "${AIE_SKIP_MODEL_PULL:-0}" = "1" ]; then
-  echo "Runtime ready; model download is handled by the app."
-  exit 0
-fi
-export OLLAMA_HOST=127.0.0.1:11435
-export OLLAMA_MODELS="$AIE_SEMANTIC_HOME/models"
-export OLLAMA_NO_CLOUD=1
-export OLLAMA_NUM_PARALLEL=1
-if ! curl -fsS --max-time 2 http://127.0.0.1:11435/api/tags >/dev/null 2>&1; then
-  "$AIE_SEMANTIC_HOME/bin/ollama" serve >"$AIE_SCRATCH/server.log" 2>&1 &
-  AIE_SERVER_PID=$!
-  for AIE_ATTEMPT in {1..30}; do
-    if curl -fsS --max-time 2 http://127.0.0.1:11435/api/tags >/dev/null 2>&1; then break; fi
-    sleep 0.2
-  done
-fi
-python3 "$(cd "$(dirname "$0")" && pwd)/pull_local_model.py" 'qwen3-embedding:0.6b'
+# Model downloads are owned by the native installer; Gemma supplies embeddings.
+echo "Runtime ready; model download is handled by the app."

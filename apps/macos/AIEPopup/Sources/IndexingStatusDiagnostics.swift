@@ -4,6 +4,12 @@ import SwiftUI
 enum IndexingStatusDiagnostics {
     @MainActor static func runIfRequested() -> Bool {
         let args = CommandLine.arguments
+        if args.dropFirst().first == "--verify-progress-status", args.count == 3 {
+            return IndexingProgressChecks.run(at: args[2])
+        }
+        if args.dropFirst().first == "--verify-deep-settings-layout", args.count == 3 {
+            return renderDeepSettings(at: args[2])
+        }
         guard args.dropFirst().first == "--verify-indexing-layout" else { return false }
         guard args.count == 3, args[2].hasPrefix("/") else {
             fputs("usage: AIEPopup --verify-indexing-layout /absolute/output/directory\n", stderr)
@@ -59,4 +65,47 @@ enum IndexingStatusDiagnostics {
         } catch { fputs("Indexing layout failed: \(error)\n", stderr); exit(1) }
         return true
     }
+    @MainActor private static func renderDeepSettings(at path: String) -> Bool {
+        let defaults = UserDefaults.standard
+        let plan = defaults.object(forKey: ScanConfiguration.planKey)
+        let paused = defaults.object(forKey: ScanConfiguration.deepPausedKey)
+        defer {
+            if let plan { defaults.set(plan, forKey: ScanConfiguration.planKey) }
+            else { defaults.removeObject(forKey: ScanConfiguration.planKey) }
+            if let paused { defaults.set(paused, forKey: ScanConfiguration.deepPausedKey) }
+            else { defaults.removeObject(forKey: ScanConfiguration.deepPausedKey) }
+        }
+        do {
+            _ = NSApplication.shared
+            let output = URL(fileURLWithPath: path)
+            try FileManager.default.createDirectory(at: output, withIntermediateDirectories: true)
+            for state in ["off", "running", "paused", "failed", "complete"] {
+                defaults.set(state == "off" ? "semantic" : "deep", forKey: ScanConfiguration.planKey)
+                defaults.set(state == "paused", forKey: ScanConfiguration.deepPausedKey)
+                let scan = ScanProgress.shared
+                scan.llmInventoryReady = true
+                scan.llmScanned = 3; scan.llmRemaining = state == "complete" ? 0 : 2
+                scan.llmFailed = state == "failed" ? 1 : 0
+                scan.active = state == "running" ? .llm : .none
+                scan.running = state == "running"
+                scan.currentFile = state == "running" ? "独立测试图片.png" : nil
+                SemanticProgress.shared.ready = 1311; SemanticProgress.shared.total = 1311
+                SemanticProgress.shared.text = "语义索引 1311/1311"
+                SemanticProgress.shared.phase = .complete
+                let view = NSHostingView(rootView: APISettingsView(model: SearchModel(previewFiles: []))
+                    .background(Color(nsColor: .windowBackgroundColor))
+                    .environment(\.colorScheme, .light))
+                view.appearance = NSAppearance(named: .aqua)
+                view.frame = NSRect(x: 0, y: 0, width: 410, height: 520)
+                view.layoutSubtreeIfNeeded()
+                guard let bitmap = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { throw CocoaError(.fileWriteUnknown) }
+                view.cacheDisplay(in: view.bounds, to: bitmap)
+                guard let png = bitmap.representation(using: .png, properties: [:]) else { throw CocoaError(.fileWriteUnknown) }
+                try png.write(to: output.appendingPathComponent(state + ".png"))
+            }
+            print("PASS: real settings view rendered in five deep-understanding states")
+        } catch { fputs("Settings layout: \(error)\n", stderr); exit(1) }
+        return true
+    }
+
 }

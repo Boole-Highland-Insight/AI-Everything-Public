@@ -1,6 +1,6 @@
 import AppKit
 
-/// Search is a menu-bar panel. Document, settings and setup windows keep a Dock entry.
+/// Windows preserve menu-bar activation without a Dock entry.
 final class AppWindowPresence: NSObject {
     static let shared = AppWindowPresence()
     private let windows = NSHashTable<NSWindow>.weakObjects()
@@ -13,7 +13,7 @@ final class AppWindowPresence: NSObject {
 
     func show(_ window: NSWindow) {
         windows.add(window)
-        NSApp.setActivationPolicy(.regular)
+        NSApp.setActivationPolicy(.accessory)
         window.deminiaturize(nil)
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
@@ -33,6 +33,6 @@ final class AppWindowPresence: NSObject {
     }
 
     private func refresh() {
-        NSApp.setActivationPolicy(windows.allObjects.isEmpty ? .accessory : .regular)
+        NSApp.setActivationPolicy(.accessory)
     }
 }

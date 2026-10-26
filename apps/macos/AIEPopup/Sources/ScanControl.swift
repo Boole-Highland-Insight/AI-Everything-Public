@@ -10,6 +10,8 @@ final class ScanControl: ObservableObject {
     private var storedPaused: Bool
     private var interactiveUntil: TimeInterval = 0
     private var storedInteractiveRevision: UInt64 = 0
+    private var heavyModelActive = false
+    private var foregroundModelTasks = 0
 
     private init() {
         let value = UserDefaults.standard.bool(forKey: "aie.scan.userPaused")
@@ -26,13 +28,31 @@ final class ScanControl: ObservableObject {
     var isInteractiveWorkActive: Bool {
         lock.lock()
         defer { lock.unlock() }
-        return Date().timeIntervalSinceReferenceDate < interactiveUntil
+        return foregroundModelTasks > 0 || Date().timeIntervalSinceReferenceDate < interactiveUntil
+    }
+
+    func beginForegroundModelWork() {
+        lock.lock(); foregroundModelTasks += 1; lock.unlock()
+        noteInteractiveWork()
+    }
+
+    func endForegroundModelWork() {
+        lock.lock(); foregroundModelTasks = max(0, foregroundModelTasks - 1); lock.unlock()
     }
 
     var interactiveRevision: UInt64 {
         lock.lock()
         defer { lock.unlock() }
         return storedInteractiveRevision
+    }
+
+    var isHeavyModelActive: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return heavyModelActive
+    }
+
+    func setHeavyModelActive(_ value: Bool) {
+        lock.lock(); heavyModelActive = value; lock.unlock()
     }
 
     /// Give typing and retrieval a short exclusive window. Background scanners call
@@ -57,14 +77,15 @@ final class ScanControl: ObservableObject {
             lock.lock()
             let paused = storedPaused
             let delay = interactiveUntil - Date().timeIntervalSinceReferenceDate
+            let foreground = foregroundModelTasks > 0
             lock.unlock()
             if paused { return false }
-            if delay <= 0, BackgroundResourcePolicy.allowsBackgroundModelWork { return true }
+            if !foreground, delay <= 0, BackgroundResourcePolicy.allowsBackgroundModelWork { return true }
             if BackgroundResourcePolicy.pauseReason != nil {
                 Thread.sleep(forTimeInterval: 1)
                 continue
             }
-            Thread.sleep(forTimeInterval: min(delay, 0.1))
+            Thread.sleep(forTimeInterval: foreground ? 0.1 : max(0.01, min(delay, 0.1)))
         }
     }
 

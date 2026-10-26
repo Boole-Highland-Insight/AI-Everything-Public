@@ -2,6 +2,19 @@ import Foundation
 import GRDB
 import NaturalLanguage
 
+public struct IndexedFileMetadata: Sendable {
+    public let fileID: String
+    public let versionID: String
+    public let contentHash: String
+    public let path: String
+    public let relativePath: String
+    public let rootPath: String
+    public let kind: String
+    public let ext: String
+    public let size: Int64
+    public let modifiedAt: Double
+}
+
 /// Drops the decoded vector matrix after any committed write. The hit path then skips the
 /// chunk/file/feature join that was measured at about 330 ms per query.
 private final class VectorWorkspaceInvalidator: TransactionObserver {
@@ -22,27 +35,36 @@ private final class VectorWorkspaceInvalidator: TransactionObserver {
 public final class ContentStore: @unchecked Sendable {
     public static let defaultIndexSoftLimitBytes: Int64 = 1_717_986_918
 
+    public let isReadOnly: Bool
     private let filePath: String
     private let vectorIndex: any VectorIndex
     private let workspaceLock = NSLock()
     private let workspaceInvalidator = VectorWorkspaceInvalidator()
     private var workspaceGeneration: UInt64 = 0
-    private var vectorWorkspace: VectorWorkspace?
+    private var vectorWorkspaces: [VectorWorkspaceKey: VectorWorkspace] = [:]
     let database: DatabasePool
 
-    public init(path: String, vectorIndex: any VectorIndex = ExactVectorIndex()) throws {
+    public init(path: String, vectorIndex: any VectorIndex = ExactVectorIndex(), readOnly: Bool = false) throws {
+        isReadOnly = readOnly
         filePath = path
         self.vectorIndex = vectorIndex
         let url = URL(fileURLWithPath: path)
-        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true,
-                                                attributes: [.posixPermissions: 0o700])
-        if !FileManager.default.fileExists(atPath: path) {
-            guard FileManager.default.createFile(atPath: path, contents: nil, attributes: [.posixPermissions: 0o600]) else { throw CocoaError(.fileWriteUnknown) }
+        if !readOnly {
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true,
+                                                    attributes: [.posixPermissions: 0o700])
+            if !FileManager.default.fileExists(atPath: path) {
+                guard FileManager.default.createFile(atPath: path, contents: nil, attributes: [.posixPermissions: 0o600]) else { throw CocoaError(.fileWriteUnknown) }
+            }
         }
         var configuration = Configuration()
+        configuration.readonly = readOnly
         configuration.busyMode = .timeout(10)
-        configuration.prepareDatabase { db in try db.execute(sql: "PRAGMA foreign_keys = ON") }
+        configuration.prepareDatabase { db in
+            try db.execute(sql: "PRAGMA foreign_keys = ON")
+            if readOnly { try db.execute(sql: "PRAGMA query_only = ON") }
+        }
         database = try DatabasePool(path: path, configuration: configuration)
+        if readOnly { return }
         var migrator = DatabaseMigrator()
         migrator.registerMigration("v1_layered_content") { db in
             try db.execute(sql: """
@@ -526,6 +548,31 @@ public final class ContentStore: @unchecked Sendable {
                 try db.execute(sql: "CREATE INDEX relations_to_subject ON relations(to_subject_type,to_subject_id)")
             }
         }
+        migrator.registerMigration("v13_current_version_lookup", foreignKeyChecks: .immediate) { db in
+            guard try db.tableExists("files") else { return }
+            // Semantic usage and retrieval join each chunk to its current file version.
+            // Without this lookup, SQLite can scan every file once per embedding.
+            try db.execute(sql: "CREATE INDEX files_current_version ON files(current_version_id)")
+        }
+        migrator.registerMigration("v14_semantic_method_lookup", foreignKeyChecks: .immediate) { db in
+            guard try db.tableExists("semantic_records") else { return }
+            try db.execute(sql: "CREATE INDEX semantic_records_method ON semantic_records(method,chunk_id)")
+        }
+        migrator.registerMigration("v15_visual_embedding_retry", foreignKeyChecks: .immediate) { db in
+            guard try db.tableExists("chunks") else { return }
+            try db.execute(sql: """
+                CREATE INDEX chunks_version_page_kind ON chunks(version_id,page,kind);
+                CREATE TABLE visual_embedding_attempts(
+                    chunk_id TEXT NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
+                    model_key TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+                    retry_after DOUBLE NOT NULL DEFAULT 0, last_error TEXT,
+                    PRIMARY KEY(chunk_id,model_key));
+                """)
+        }
+        migrator.registerMigration("v16_feature_subject_lookup", foreignKeyChecks: .immediate) { db in
+            guard try db.tableExists("features") else { return }
+            try db.execute(sql: "CREATE INDEX features_subject_lookup ON features(subject_type,subject_id,feature_type)")
+        }
         let requiresBackup = try database.read { db in
             try db.tableExists("grdb_migrations") && !String.fetchAll(db, sql: "SELECT identifier FROM grdb_migrations").contains("v2_database_source")
         }
@@ -563,7 +610,7 @@ public final class ContentStore: @unchecked Sendable {
     fileprivate func clearVectorWorkspace() {
         workspaceLock.lock()
         workspaceGeneration &+= 1
-        vectorWorkspace = nil
+        vectorWorkspaces.removeAll()
         workspaceLock.unlock()
     }
 
@@ -678,6 +725,7 @@ public final class ContentStore: @unchecked Sendable {
                     THEN 'current' ELSE 'historical' END
                 """)
             try Self.refreshExactDuplicateRelations(db: db)
+            try Self.retireInactiveSearchChunks(db: db)
             try db.execute(sql: "DROP TABLE aie_current_snapshot")
         }
     }
@@ -768,7 +816,19 @@ public final class ContentStore: @unchecked Sendable {
                 UPDATE item_locators SET state='historical'
                 WHERE source_id IN (SELECT id FROM sources WHERE authorization_state='revoked')
                 """)
+            try Self.retireInactiveSearchChunks(db: db)
         }
+    }
+
+    /// Derived search data is current-only. Version, analysis, trash and artifact records remain.
+    /// Existing delete triggers remove the matching FTS, content units and vectors atomically.
+    private static func retireInactiveSearchChunks(db: Database) throws {
+        try db.execute(sql: """
+            DELETE FROM chunks WHERE version_id NOT IN (
+                SELECT f.current_version_id FROM files f JOIN roots r ON r.id=f.root_id
+                WHERE f.present=1 AND r.active=1 AND f.current_version_id IS NOT NULL
+            )
+            """)
     }
 
     func upsert(_ doc: SourceDocument, db: Database) throws {
@@ -786,7 +846,10 @@ public final class ContentStore: @unchecked Sendable {
             ON CONFLICT(id) DO UPDATE SET coverage=excluded.coverage,import_signature=excluded.import_signature
             """, arguments: [versionID, doc.id, doc.contentHash, doc.size, Date().timeIntervalSince1970, doc.coverage, signature])
         try db.execute(sql: "UPDATE files SET current_version_id=? WHERE id=?", arguments: [versionID, doc.id])
-        guard signature != previous else { return }
+        // Re-adding a revoked/deleted file must restore its retired search projection.
+        let hasChunks = try Bool.fetchOne(db, sql: "SELECT EXISTS(SELECT 1 FROM chunks WHERE version_id=?)",
+                                          arguments: [versionID]) ?? false
+        guard signature != previous || !hasChunks else { return }
         let blockIDs = Set(doc.blocks.map { ContentIdentity.chunk(versionID: versionID, key: $0.key) })
         for id in try String.fetchAll(db, sql: "SELECT id FROM chunks WHERE version_id=?", arguments: [versionID]) where !blockIDs.contains(id) {
             try db.execute(sql: "DELETE FROM chunks WHERE id=?", arguments: [id])
@@ -799,7 +862,7 @@ public final class ContentStore: @unchecked Sendable {
             let keywords = isRoot ? doc.fileKeywords : block.tags
             let contentHash = ContentIdentity.digest([block.text, summary, keywords.joined(separator: "\n")].joined(separator: "\n"))
             try db.execute(sql: """
-                DELETE FROM features
+                DELETE FROM features INDEXED BY features_subject_lookup
                 WHERE subject_type='content_unit' AND subject_id=? AND feature_type='text_embedding' AND content_hash<>?
                 """, arguments: [id, contentHash])
             try db.execute(sql: """
@@ -1136,7 +1199,7 @@ public final class ContentStore: @unchecked Sendable {
                 arguments: [versionID]
             ) == true else { return nil }
             let decoder = JSONDecoder()
-            return try Row.fetchAll(db, sql: """
+            let rows = try Row.fetchAll(db, sql: """
                 SELECT c.block_key,c.kind,c.page,c.start_seconds,c.end_seconds,c.location_json,c.text,
                        c.parser_version,p.block_key AS parent_key,
                        coalesce(s.summary,'') AS summary,coalesce(s.keywords_json,'[]') AS keywords_json,
@@ -1144,9 +1207,12 @@ public final class ContentStore: @unchecked Sendable {
                 FROM chunks c
                 LEFT JOIN chunks p ON p.id=c.parent_id
                 LEFT JOIN semantic_records s ON s.chunk_id=c.id
-                WHERE c.version_id=? AND c.parser_version=? AND c.block_key<>'document'
+                WHERE c.version_id=? AND c.block_key<>'document'
+                  AND (c.parser_version=? OR (p.parser_version=? AND c.parser_version='structure-1'))
                 ORDER BY c.rowid
-                """, arguments: [versionID, parserVersion]).map { row in
+                """, arguments: [versionID, parserVersion, parserVersion])
+            guard !rows.isEmpty else { return nil }
+            return rows.map { row in
                     let keywordsJSON: String = row["keywords_json"]
                     return ContentBlock(
                         key: row["block_key"], parentKey: row["parent_key"], kind: row["kind"],
@@ -1165,6 +1231,44 @@ public final class ContentStore: @unchecked Sendable {
         let (whereSQL, args) = authorization(rootPaths)
         return try database.read { db in
             try Row.fetchAll(db, sql: Self.selectChunk + " WHERE " + whereSQL + " ORDER BY f.path,c.page,c.block_key", arguments: args).map { self.result($0) }
+        }
+    }
+
+    /// Metadata only: no filesystem enumeration, parsing or projection updates.
+    public func indexedFileMetadata(rootPaths: [String]) throws -> [IndexedFileMetadata] {
+        guard !rootPaths.isEmpty else { return [] }
+        let (whereSQL, args) = authorization(rootPaths)
+        return try database.read { db in
+            try Row.fetchAll(db, sql: """
+                SELECT f.id,f.path,f.relative_path,r.path AS root_path,f.kind,f.ext,f.size,f.modified_at,
+                       v.id AS version_id,v.content_hash
+                FROM files f JOIN roots r ON r.id=f.root_id
+                JOIN file_versions v ON v.id=f.current_version_id
+                WHERE \(whereSQL) ORDER BY f.path
+                """, arguments: args).map { row in
+                    IndexedFileMetadata(fileID: row["id"], versionID: row["version_id"],
+                        contentHash: row["content_hash"], path: row["path"], relativePath: row["relative_path"],
+                        rootPath: row["root_path"], kind: row["kind"], ext: row["ext"],
+                        size: row["size"], modifiedAt: row["modified_at"])
+                }
+        }
+    }
+
+    /// Check the pool's primary connection, not only an implicitly read-only reader.
+    /// The no-row probe must be rejected by SQLite before evaluation is allowed to proceed.
+    public func verifyReadOnlyAccess() throws {
+        guard isReadOnly else { throw DataLayerError.invalidDocument("Evaluation database is not read-only") }
+        try database.writeWithoutTransaction { db in
+            guard db.configuration.readonly,
+                  try Int.fetchOne(db, sql: "PRAGMA query_only") == 1 else {
+                throw DataLayerError.invalidDocument("SQLite read-only protection is unavailable")
+            }
+            do {
+                try db.execute(sql: "UPDATE files SET present=present WHERE 0")
+            } catch let error as DatabaseError where error.resultCode == .SQLITE_READONLY {
+                return
+            }
+            throw DataLayerError.invalidDocument("SQLite unexpectedly accepted the write probe")
         }
     }
 
@@ -1204,9 +1308,10 @@ public final class ContentStore: @unchecked Sendable {
 
     private func searchProjected(allTerms: [[String]], anyTerms: [String], rootPaths: [String], limit: Int) throws -> [ChunkResult] {
         guard !rootPaths.isEmpty else { return [] }
+        let sourceColumns = "{filename body_text ocr_text transcript_text chart_text}:"
         let groups = allTerms + (anyTerms.isEmpty ? [] : [anyTerms])
         let clauses = groups.compactMap { group -> String? in
-            let terms = group.compactMap(SearchEncoding.expression)
+            let terms = group.compactMap(SearchEncoding.expression).map { sourceColumns + $0 }
             return terms.isEmpty ? nil : "(" + terms.joined(separator: " OR ") + ")"
         }
         guard !clauses.isEmpty else { return [] }
@@ -1218,26 +1323,28 @@ public final class ContentStore: @unchecked Sendable {
                 var alternatives: [String] = []
                 for term in group {
                     if let number = NumericSearch.term(term) {
-                        alternatives.append("instr(search_documents_fts.identifiers,?)>0")
+                        alternatives.append("instr(CASE WHEN c.kind='document' THEN sd.filename ELSE search_documents_fts.identifiers END,?)>0")
                         checksArguments += [number]
                     } else if let expression = SearchEncoding.expression(term) {
                         alternatives.append("sd.id IN (SELECT search_document_id FROM search_documents_fts WHERE search_documents_fts MATCH ?)")
-                        checksArguments += [expression]
+                        checksArguments += [sourceColumns + expression]
                     }
                 }
                 numericChecks.append("(" + alternatives.joined(separator: " OR ") + ")")
             }
             let verification = numericChecks.isEmpty ? "" : " AND " + numericChecks.joined(separator: " AND ")
             let sql = """
-                SELECT c.*,f.id AS file_id,f.path,f.relative_path,s.summary,s.keywords_json
+                SELECT c.*,f.id AS file_id,f.path,f.relative_path,'' AS summary,'[]' AS keywords_json
                 FROM search_documents_fts
                 JOIN search_documents sd ON sd.id=search_documents_fts.search_document_id
                 JOIN content_units cu ON cu.id=sd.unit_id
                 JOIN chunks c ON c.id=cu.id
                 JOIN files f ON f.current_version_id=c.version_id
                 JOIN roots r ON r.id=f.root_id
-                JOIN semantic_records s ON s.chunk_id=c.id
-                WHERE \(whereSQL) AND search_documents_fts MATCH ?\(verification)
+                WHERE \(whereSQL) AND c.kind IN ('document','paragraph','page','page_text','slide','slide_text',
+                    'sheet_rows','table_text','xml_text','archive_text','message_body','transcript','transcript_excerpt',
+                    'image_ocr','frame_ocr')
+                    AND search_documents_fts MATCH ?\(verification)
                 ORDER BY bm25(search_documents_fts,0.0,10.0,1.2,6.0,1.5,1.1,1.2,1.5,0.6,0.7,0.7,0.0),
                          f.path,c.page LIMIT ?
                 """
@@ -1255,9 +1362,57 @@ public final class ContentStore: @unchecked Sendable {
         }
     }
 
+    /// File-level DeepScan summaries only; both the stored source hash and its projection must match.
+    public func deepScanEmbeddingInputs(
+        spaceID: String, legacySpaceID: String, modelID: String, modelVersion: String,
+        dimensions: Int, rootPaths: [String]
+    ) throws -> [(chunk: ChunkResult, vector: [Float]?, indexed: Bool)] {
+        guard !rootPaths.isEmpty else { return [] }
+        let (clause, args) = authorization(rootPaths)
+        return try database.read { db in
+            let rows = try Row.fetchAll(db, sql: """
+                SELECT c.*,f.id AS file_id,f.path,f.relative_path,s.summary,s.keywords_json,
+                       x.vector_blob AS indexed_vector,old.vector_blob AS reusable_vector
+                FROM chunks c JOIN files f ON f.current_version_id=c.version_id
+                JOIN roots r ON r.id=f.root_id JOIN file_versions v ON v.id=c.version_id
+                JOIN semantic_records s ON s.chunk_id=c.id
+                JOIN analysis_records a ON f.path=a.root_path||'/'||a.relative_path
+                JOIN analysis_fields d ON d.record_id=a.id AND d.parent_id=0 AND d.name='deepScan'
+                JOIN analysis_fields p ON p.record_id=a.id AND p.parent_id=d.node_id AND p.name='parse'
+                JOIN analysis_fields h ON h.record_id=a.id AND h.parent_id=p.node_id AND h.name='sourceHash'
+                JOIN analysis_fields b ON b.record_id=a.id AND b.parent_id=d.node_id AND b.name='blurb_zh'
+                JOIN analysis_fields m ON m.record_id=a.id AND m.parent_id=p.node_id AND m.name='model'
+                JOIN analysis_fields pv ON pv.record_id=a.id AND pv.parent_id=p.node_id AND pv.name='parserVersion'
+                LEFT JOIN features x ON x.subject_type='content_unit' AND x.subject_id=c.id
+                    AND x.feature_type='text_embedding' AND x.model_key=? AND x.model_revision=?
+                    AND x.model_identifier=? AND x.dimensions=? AND x.vector_format=?
+                    AND x.metric='cosine' AND x.content_hash=c.content_hash
+                LEFT JOIN features old ON old.subject_type='content_unit' AND old.subject_id=c.id
+                    AND old.feature_type='text_embedding' AND old.model_key=? AND old.model_revision=?
+                    AND old.model_identifier=? AND old.dimensions=? AND old.vector_format=?
+                    AND old.metric='cosine' AND old.content_hash=c.content_hash
+                WHERE \(clause) AND c.kind='document' AND s.method='file_summary'
+                    AND h.text_value=v.content_hash AND b.text_value=s.summary AND trim(s.summary)<>''
+                    AND lower(m.text_value) LIKE '%8b%' AND s.model_id=m.text_value
+                    AND s.model_version=pv.text_value
+                ORDER BY f.path
+                """, arguments: [spaceID, modelVersion, modelID, dimensions, VectorCodec.format,
+                                   legacySpaceID, modelVersion, modelID, dimensions, VectorCodec.format] + args)
+            return rows.map { row in
+                func vector(_ column: String) -> [Float]? {
+                    guard let blob = row[column] as Data? else { return nil }
+                    return try? VectorCodec.decode(blob, expectedDimensions: dimensions)
+                }
+                let indexed = vector("indexed_vector")
+                return (self.result(row), indexed ?? vector("reusable_vector"), indexed != nil)
+            }
+        }
+    }
+
     /// Model adapters supply real vectors. No zero vectors or invented embeddings are generated here.
     public func putEmbedding(chunkID: String, spaceID: String, modelID: String, modelVersion: String,
-                             vector: [Float], rootPaths: [String], expectedContentHash: String? = nil) throws {
+                             vector: [Float], rootPaths: [String], expectedContentHash: String? = nil,
+                             featureType: String = "text_embedding") throws {
         guard !vector.isEmpty, vector.allSatisfy(\.isFinite), vector.contains(where: { $0 != 0 }),
               !spaceID.isEmpty, !modelID.isEmpty else { throw DataLayerError.invalidEmbedding }
         let data = try VectorCodec.encode(vector)
@@ -1267,8 +1422,8 @@ public final class ContentStore: @unchecked Sendable {
             guard try Row.fetchOne(db, sql: Self.selectChunk + " WHERE " + clause + " AND c.id=?", arguments: auth + [chunkID]) != nil else { throw DataLayerError.staleVersion }
             if let row = try Row.fetchOne(db, sql: """
                 SELECT model_identifier,model_revision,dimensions FROM features
-                WHERE feature_type='text_embedding' AND model_key=? LIMIT 1
-                """, arguments: [spaceID]) {
+                WHERE feature_type=? AND model_key=? LIMIT 1
+                """, arguments: [featureType, spaceID]) {
                 guard row["model_identifier"] as String? == modelID,
                       row["model_revision"] as String == modelVersion,
                       row["dimensions"] as Int == vector.count else {
@@ -1278,7 +1433,7 @@ public final class ContentStore: @unchecked Sendable {
             let hash = try String.fetchOne(db, sql: "SELECT content_hash FROM chunks WHERE id=?", arguments: [chunkID])!
             if let expectedContentHash, hash != expectedContentHash { throw DataLayerError.staleVersion }
             let featureID = ContentIdentity.digest(
-                [chunkID, "text_embedding", spaceID, modelVersion].joined(separator: ":")
+                [chunkID, featureType, spaceID, modelVersion].joined(separator: ":")
             )
             try db.execute(sql: """
                 INSERT INTO features(
@@ -1292,7 +1447,7 @@ public final class ContentStore: @unchecked Sendable {
                     created_at=excluded.created_at,vector_format=excluded.vector_format,
                     model_identifier=excluded.model_identifier
                 """, arguments: [
-                    featureID, "content_unit", chunkID, "text_embedding", spaceID, modelVersion,
+                    featureID, "content_unit", chunkID, featureType, spaceID, modelVersion,
                     vector.count, "cosine", data, hash, nil, Date().timeIntervalSince1970,
                     VectorCodec.format, modelID,
                 ])
@@ -1307,7 +1462,8 @@ public final class ContentStore: @unchecked Sendable {
     }
 
     public func searchVectorProfiled(
-        _ vector: [Float], spaceID: String, rootPaths: [String], limit: Int = 20
+        _ vector: [Float], spaceID: String, rootPaths: [String], limit: Int = 20,
+        featureType: String = "text_embedding", v1RawTextOnly: Bool = false
     ) throws -> VectorSearchOutput {
         func emptyOutput() -> VectorSearchOutput {
             VectorSearchOutput(
@@ -1324,16 +1480,17 @@ public final class ContentStore: @unchecked Sendable {
         guard !vector.isEmpty, vector.allSatisfy(\.isFinite) else { throw DataLayerError.invalidEmbedding }
         guard vector.contains(where: { $0 != 0 }) else { throw DataLayerError.invalidEmbedding }
         guard limit > 0 else { return emptyOutput() }
-        let (whereSQL, args) = authorization(rootPaths)
+        let (authorizedSQL, args) = authorization(rootPaths)
+        let whereSQL = authorizedSQL + (v1RawTextOnly ? " AND " + Self.v1RawTextScope : "")
         let totalStarted = ProcessInfo.processInfo.systemUptime
         return try database.read { db in
             let connectionWait = (ProcessInfo.processInfo.systemUptime - totalStarted) * 1_000
             let metadataStarted = ProcessInfo.processInfo.systemUptime
             guard let dimensions = try Int.fetchOne(db, sql: """
                 SELECT dimensions FROM features
-                WHERE feature_type='text_embedding' AND model_key=? AND vector_format=?
+                WHERE feature_type=? AND model_key=? AND vector_format=?
                 LIMIT 1
-                """, arguments: [spaceID, VectorCodec.format]) else {
+                """, arguments: [featureType, spaceID, VectorCodec.format]) else {
                 let total = (ProcessInfo.processInfo.systemUptime - totalStarted) * 1_000
                 return VectorSearchOutput(
                     matches: [],
@@ -1351,8 +1508,8 @@ public final class ContentStore: @unchecked Sendable {
             let metadataRead = (ProcessInfo.processInfo.systemUptime - metadataStarted) * 1_000
             let workspaceStarted = ProcessInfo.processInfo.systemUptime
             if let workspace = try vectorWorkspace(
-                db: db, spaceID: spaceID, dimensions: dimensions, rootPaths: rootPaths,
-                whereSQL: whereSQL, arguments: args + [spaceID, VectorCodec.format]
+                db: db, spaceID: spaceID, featureType: featureType, dimensions: dimensions, rootPaths: rootPaths,
+                whereSQL: whereSQL, arguments: args
             ) {
                 let candidateRead = (ProcessInfo.processInfo.systemUptime - workspaceStarted) * 1_000
                 let cosineStarted = ProcessInfo.processInfo.systemUptime
@@ -1403,16 +1560,18 @@ public final class ContentStore: @unchecked Sendable {
                     )
                 )
             }
+            // Keep root/current-version filtering ahead of vector blobs. Letting SQLite start
+            // with features reads every library's vectors even when only one root is searched.
             let sql = """
                 SELECT c.id,x.vector_blob
-                FROM chunks c JOIN files f ON f.current_version_id=c.version_id
-                JOIN roots r ON r.id=f.root_id
-                JOIN features x ON x.subject_type='content_unit' AND x.subject_id=c.id
-                    AND x.content_hash=c.content_hash AND x.feature_type='text_embedding'
+                FROM files f JOIN roots r ON r.id=f.root_id
+                CROSS JOIN chunks c ON c.version_id=f.current_version_id
+                CROSS JOIN features x ON x.subject_type='content_unit' AND x.subject_id=c.id
+                    AND x.content_hash=c.content_hash AND x.feature_type=?
                 WHERE \(whereSQL) AND x.model_key=? AND x.vector_format=?
                 """
             let rows = try Row.fetchCursor(
-                db, sql: sql, arguments: args + [spaceID, VectorCodec.format]
+                db, sql: sql, arguments: [featureType] + args + [spaceID, VectorCodec.format]
             )
             var candidateRead = 0.0
             var scannedVectors = 0
@@ -1476,36 +1635,38 @@ public final class ContentStore: @unchecked Sendable {
     /// Current libraries are a few thousand vectors. Keeping that working set decoded avoids the
     /// measured 350 ms SQLite row scan and 190 ms scalar cosine. A committed write drops the
     /// matrix; larger sets stay on the stream.
-    private struct VectorWorkspace {
+    private struct VectorWorkspaceKey: Hashable {
         let spaceID: String
+        let featureType: String
         let rootsKey: String
         let dimensions: Int
+    }
+
+    private struct VectorWorkspace {
         let ids: [String]
         let matrix: [Float]
     }
 
     private func vectorWorkspace(
-        db: Database, spaceID: String, dimensions: Int, rootPaths: [String],
+        db: Database, spaceID: String, featureType: String, dimensions: Int, rootPaths: [String],
         whereSQL: String, arguments: StatementArguments
     ) throws -> VectorWorkspace? {
         guard vectorIndex is ExactVectorIndex else { return nil }
-        let rootsKey = rootPaths.sorted().joined(separator: "\n")
+        let key = VectorWorkspaceKey(spaceID: spaceID, featureType: featureType,
+                                     rootsKey: rootPaths.sorted().joined(separator: "\n") + "\n" + whereSQL, dimensions: dimensions)
         workspaceLock.lock()
         let generation = workspaceGeneration
-        let cached = vectorWorkspace
+        let cached = vectorWorkspaces[key]
         workspaceLock.unlock()
-        if let cached, cached.spaceID == spaceID, cached.rootsKey == rootsKey,
-           cached.dimensions == dimensions {
-            return cached
-        }
+        if let cached { return cached }
         let count = Int(try Int64.fetchOne(db, sql: """
             SELECT count(*)
-            FROM chunks c JOIN files f ON f.current_version_id=c.version_id
-            JOIN roots r ON r.id=f.root_id
-            JOIN features x ON x.subject_type='content_unit' AND x.subject_id=c.id
-                AND x.content_hash=c.content_hash AND x.feature_type='text_embedding'
+            FROM files f JOIN roots r ON r.id=f.root_id
+            CROSS JOIN chunks c ON c.version_id=f.current_version_id
+            CROSS JOIN features x ON x.subject_type='content_unit' AND x.subject_id=c.id
+                AND x.content_hash=c.content_hash AND x.feature_type=?
             WHERE \(whereSQL) AND x.model_key=? AND x.vector_format=?
-            """, arguments: arguments) ?? 0)
+            """, arguments: [featureType] + arguments + [spaceID, VectorCodec.format]) ?? 0)
         let matrixBytes = Int64(count) * Int64(dimensions) * Int64(MemoryLayout<Float>.size)
         guard matrixBytes <= 32 * 1_024 * 1_024 else { return nil }
 
@@ -1516,38 +1677,58 @@ public final class ContentStore: @unchecked Sendable {
         if count > 0 {
             let rows = try Row.fetchAll(db, sql: """
                 SELECT c.id,x.vector_blob
-                FROM chunks c JOIN files f ON f.current_version_id=c.version_id
-                JOIN roots r ON r.id=f.root_id
-                JOIN features x ON x.subject_type='content_unit' AND x.subject_id=c.id
-                    AND x.content_hash=c.content_hash AND x.feature_type='text_embedding'
+                FROM files f JOIN roots r ON r.id=f.root_id
+                CROSS JOIN chunks c ON c.version_id=f.current_version_id
+                CROSS JOIN features x ON x.subject_type='content_unit' AND x.subject_id=c.id
+                    AND x.content_hash=c.content_hash AND x.feature_type=?
                 WHERE \(whereSQL) AND x.model_key=? AND x.vector_format=?
-                """, arguments: arguments)
+                """, arguments: [featureType] + arguments + [spaceID, VectorCodec.format])
             for row in rows {
                 let blob: Data = row["vector_blob"]
                 ids.append(row["id"])
                 try VectorCodec.appendPayload(blob, expectedDimensions: dimensions, to: &matrix)
             }
         }
-        let built = VectorWorkspace(
-            spaceID: spaceID, rootsKey: rootsKey, dimensions: dimensions,
-            ids: ids, matrix: matrix
-        )
+        let built = VectorWorkspace(ids: ids, matrix: matrix)
         workspaceLock.lock()
         if workspaceGeneration == generation {
-            vectorWorkspace = built
+            if vectorWorkspaces.count >= 3 { vectorWorkspaces.removeAll() }
+            vectorWorkspaces[key] = built
         }
         workspaceLock.unlock()
         return built
     }
 
-    public func missingEmbeddings(spaceID: String, rootPaths: [String], limit: Int = 8) throws -> [ChunkResult] {
+    public func missingEmbeddings(
+        spaceID: String, rootPaths: [String], limit: Int = 8,
+        semanticMethods: [String]? = nil, rawTextOnly: Bool = false,
+        includeAllTextKinds: Bool = false
+    ) throws -> [ChunkResult] {
         guard !rootPaths.isEmpty else { return [] }
         let (clause, args) = authorization(rootPaths)
+        let selectedMethods = semanticMethods?.filter { !$0.isEmpty }
+        let recordJoin = rawTextOnly ? "LEFT JOIN" : "JOIN"
+        let methodClause: String
+        var methodArguments = StatementArguments()
+        if rawTextOnly {
+            methodClause = includeAllTextKinds
+                ? " AND " + Self.v1RawTextScope
+                : " AND lower(f.ext) IN ('txt','md','pdf')"
+                    + " AND c.kind IN ('paragraph','page','page_text') AND length(trim(c.text))>=12"
+        } else if let selectedMethods {
+            guard !selectedMethods.isEmpty else { return [] }
+            methodClause = " AND s.method IN (" + selectedMethods.map { _ in "?" }.joined(separator: ",") + ")"
+                + " AND (s.method<>'file_summary' OR trim(s.summary)<>'' OR s.keywords_json<>'[]')"
+            methodArguments += StatementArguments(selectedMethods)
+        } else {
+            methodClause = ""
+        }
         return try database.read { db in
             let batchLimit = max(1, min(limit, 100))
             let candidateLimit = max(256, min(batchLimit * 32, 2_000))
             let rows = try Row.fetchAll(db, sql: """
-                 SELECT c.*,f.id AS file_id,f.path,f.relative_path,s.summary,s.keywords_json,
+                 SELECT c.*,f.id AS file_id,f.path,f.relative_path,
+                        coalesce(s.summary,'') AS summary,coalesce(s.keywords_json,'[]') AS keywords_json,
                  \(Self.semanticContentClassSQL) AS budget_class,
                  row_number() OVER (
                     PARTITION BY f.id
@@ -1557,13 +1738,13 @@ public final class ContentStore: @unchecked Sendable {
                  FROM chunks c
                  JOIN files f ON f.current_version_id=c.version_id
                  JOIN roots r ON r.id=f.root_id
-                 JOIN semantic_records s ON s.chunk_id=c.id
+                 \(recordJoin) semantic_records s ON s.chunk_id=c.id
                  LEFT JOIN features x ON x.subject_type='content_unit' AND x.subject_id=c.id
                     AND x.content_hash=c.content_hash AND x.feature_type='text_embedding'
                     AND x.model_key=? AND x.vector_format=?
-                 WHERE \(clause) AND x.id IS NULL
+                 WHERE \(clause)\(methodClause) AND x.id IS NULL
                  ORDER BY file_rank,f.modified_at DESC,f.path,c.block_key LIMIT ?
-                """, arguments: [spaceID, VectorCodec.format] + args + [candidateLimit])
+                """, arguments: [spaceID, VectorCodec.format] + args + methodArguments + [candidateLimit])
             var groups = Dictionary(grouping: rows) { row in
                 SemanticContentClass(rawValue: row["budget_class"] as String) ?? .other
             }.mapValues { $0.map { self.result($0) } }
@@ -1590,7 +1771,62 @@ public final class ContentStore: @unchecked Sendable {
             return selected
         }
     }
-    public func embeddingCoverage(spaceID: String, rootPaths: [String]) throws -> (ready: Int, total: Int) {
+    public func embeddingCoverage(
+        spaceID: String, rootPaths: [String], semanticMethods: [String]? = nil,
+        rawTextOnly: Bool = false, includeAllTextKinds: Bool = false
+    ) throws -> (ready: Int, total: Int) {
+        guard !rootPaths.isEmpty else { return (0, 0) }
+        let (clause, args) = authorization(rootPaths)
+        let selectedMethods = semanticMethods?.filter { !$0.isEmpty }
+        let recordJoin = rawTextOnly ? "" : "JOIN semantic_records s ON s.chunk_id=c.id"
+        let methodClause: String
+        var methodArguments = StatementArguments()
+        if rawTextOnly {
+            methodClause = includeAllTextKinds
+                ? " AND " + Self.v1RawTextScope
+                : " AND lower(f.ext) IN ('txt','md','pdf')"
+                    + " AND c.kind IN ('paragraph','page','page_text') AND length(trim(c.text))>=12"
+        } else if let selectedMethods {
+            guard !selectedMethods.isEmpty else { return (0, 0) }
+            methodClause = " AND s.method IN (" + selectedMethods.map { _ in "?" }.joined(separator: ",") + ")"
+                + " AND (s.method<>'file_summary' OR trim(s.summary)<>'' OR s.keywords_json<>'[]')"
+            methodArguments += StatementArguments(selectedMethods)
+        } else {
+            methodClause = ""
+        }
+        return try database.read { db in
+            let row = try Row.fetchOne(db, sql: """
+                SELECT count(x.id) AS ready,count(c.id) AS total
+                FROM chunks c JOIN files f ON f.current_version_id=c.version_id
+                JOIN roots r ON r.id=f.root_id
+                \(recordJoin)
+                LEFT JOIN features x ON x.subject_type='content_unit' AND x.subject_id=c.id
+                    AND x.content_hash=c.content_hash AND x.feature_type='text_embedding'
+                    AND x.model_key=? AND x.vector_format=?
+                WHERE \(clause)\(methodClause)
+                """, arguments: [spaceID, VectorCodec.format] + args + methodArguments)!
+            return (row["ready"], row["total"])
+        }
+    }
+
+    private static let v1RawTextScope = "c.kind IN ('paragraph','page','page_text','slide','slide_text',"
+        + "'sheet_rows','table_text','xml_text','archive_text','message_body','transcript','transcript_excerpt') AND length(trim(c.text))>=12"
+
+    private static let visualScope = """
+        (c.kind IN ('visual_image','visual_frame') OR
+         (c.kind='visual_page' AND (
+            c.page<=3 OR
+            NOT EXISTS(SELECT 1 FROM chunks p WHERE p.version_id=c.version_id AND p.page=c.page
+                       AND p.kind IN ('page','page_text') AND length(trim(p.text))>0) OR
+            (SELECT coalesce(sum(length(p.text)),0) FROM chunks p WHERE p.version_id=c.version_id
+             AND p.page=c.page AND p.kind IN ('page','page_text'))<500 OR
+            EXISTS(SELECT 1 FROM chunks p WHERE p.version_id=c.version_id AND p.page=c.page
+                   AND p.kind IN ('page','page_text')
+                   AND (p.text LIKE '%Figure%' OR p.text LIKE '%Fig.%' OR p.text LIKE '%图%'))
+         )))
+        """
+
+    public func visualEmbeddingCoverage(spaceID: String, rootPaths: [String]) throws -> (ready: Int, total: Int) {
         guard !rootPaths.isEmpty else { return (0, 0) }
         let (clause, args) = authorization(rootPaths)
         return try database.read { db in
@@ -1599,11 +1835,51 @@ public final class ContentStore: @unchecked Sendable {
                 FROM chunks c JOIN files f ON f.current_version_id=c.version_id
                 JOIN roots r ON r.id=f.root_id
                 LEFT JOIN features x ON x.subject_type='content_unit' AND x.subject_id=c.id
-                    AND x.content_hash=c.content_hash AND x.feature_type='text_embedding'
+                    AND x.content_hash=c.content_hash AND x.feature_type='visual_embedding'
                     AND x.model_key=? AND x.vector_format=?
-                WHERE \(clause)
+                WHERE \(clause) AND (\(Self.visualScope) OR x.id IS NOT NULL)
                 """, arguments: [spaceID, VectorCodec.format] + args)!
             return (row["ready"], row["total"])
+        }
+    }
+
+    public func missingVisualEmbeddings(spaceID: String, rootPaths: [String], limit: Int = 1) throws -> [ChunkResult] {
+        guard !rootPaths.isEmpty, limit > 0 else { return [] }
+        let (clause, args) = authorization(rootPaths)
+        return try database.read { db in
+            try Row.fetchAll(db, sql: Self.selectChunk + """
+
+                LEFT JOIN features x ON x.subject_type='content_unit' AND x.subject_id=c.id
+                    AND x.content_hash=c.content_hash AND x.feature_type='visual_embedding'
+                    AND x.model_key=? AND x.vector_format=?
+                LEFT JOIN visual_embedding_attempts a ON a.chunk_id=c.id AND a.model_key=?
+                WHERE \(clause) AND \(Self.visualScope) AND x.id IS NULL
+                    AND coalesce(a.retry_after,0)<=?
+                ORDER BY CASE c.kind WHEN 'visual_image' THEN 0 WHEN 'visual_frame' THEN 1 ELSE 2 END,
+                         coalesce(a.attempts,0),f.path,c.page
+                LIMIT ?
+                """, arguments: [spaceID, VectorCodec.format, spaceID] + args
+                    + [Date().timeIntervalSince1970, limit]).map { self.result($0) }
+        }
+    }
+
+    public func recordVisualEmbeddingFailure(chunkID: String, spaceID: String, rootPaths: [String], error: String) throws {
+        guard try chunk(id: chunkID, rootPaths: rootPaths) != nil else { throw DataLayerError.missingChunk }
+        try database.write { db in
+            try db.execute(sql: """
+                INSERT INTO visual_embedding_attempts(chunk_id,model_key,attempts,retry_after,last_error)
+                VALUES(?,?,1,?,?)
+                ON CONFLICT(chunk_id,model_key) DO UPDATE SET
+                    attempts=attempts+1,retry_after=excluded.retry_after,last_error=excluded.last_error
+                """, arguments: [chunkID, spaceID, Date().addingTimeInterval(60).timeIntervalSince1970,
+                                   String(error.prefix(240))])
+        }
+    }
+
+    public func clearVisualEmbeddingFailure(chunkID: String, spaceID: String) throws {
+        try database.write { db in
+            try db.execute(sql: "DELETE FROM visual_embedding_attempts WHERE chunk_id=? AND model_key=?",
+                           arguments: [chunkID, spaceID])
         }
     }
 

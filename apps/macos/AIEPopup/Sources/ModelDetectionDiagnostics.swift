@@ -52,7 +52,7 @@ enum ModelDetectionDiagnostics {
     }
 
     private static func report() {
-        let models = [LocalQuickScan.embeddingModel] + [2, 4, 8].map { "qwen3-vl:\($0)b-instruct-q4_K_M" }
+        let models = [2, 4, 8].map { "qwen3-vl:\($0)b-instruct-q4_K_M" }
         print("private store: " + LocalModelLibrary.privateModels.path)
         let shared = LocalModelLibrary.sharedStores()
         print("other ollama stores: " + (shared.isEmpty ? "none" : shared.map(\.path).joined(separator: ", ")))

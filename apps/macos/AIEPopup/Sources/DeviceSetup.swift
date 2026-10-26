@@ -152,8 +152,7 @@ enum DeviceSetupStep: Int, CaseIterable {
             profile = result
             if !recommendationApplied {
                 // Preserve an explicit choice; new setups start with the recommended 8B plan.
-                selectedPlan = UserDefaults.standard.string(forKey: ScanConfiguration.planKey).flatMap(LocalScanPlan.init(rawValue:))
-                    ?? .deep
+                selectedPlan = ScanConfiguration.initialPlan()
                 recommendationApplied = true
             }
         }
@@ -164,7 +163,8 @@ enum DeviceSetupStep: Int, CaseIterable {
     }
 
     func modelsAvailable(for plan: LocalScanPlan) -> Bool {
-        plan.models.allSatisfy { LocalModelLibrary.isAvailable($0) }
+        (!LocalSemanticIndex.usesGemma || LocalGemmaWorker.isAvailable)
+            && plan.models.allSatisfy { LocalModelLibrary.isAvailable($0) }
     }
 
     var selectedPlanInstalled: Bool {
@@ -269,8 +269,8 @@ enum DeviceSetupStep: Int, CaseIterable {
             message = "基础搜索已经可用；本地模型尚未就绪，可以重试安装。"
         } else if selectedPlanInstalled {
             message = selectedPlan == .semantic
-                ? "已启用 Qwen3 Embedding 0.6B；正文与 OCR 文字的语义索引会在后台继续。"
-                : "已启用 Qwen3 Embedding 0.6B 与 \(LocalQuickScan.displayName)；内容分析会在后台继续。"
+                ? "已启用 EmbeddingGemma 2；文字与视觉语义索引会在后台继续。"
+                : "已启用 EmbeddingGemma 2 与 \(LocalQuickScan.displayName)；内容分析会在后台继续。"
         } else {
             message = selectedPlan == .semantic
                 ? "基础搜索已经可用；语义索引会在后台逐步补齐。"
@@ -328,12 +328,18 @@ enum DeviceSetupStep: Int, CaseIterable {
             do {
                 // Wait for previous inference to finish before switching or disabling vision.
                 await LocalQuickScan.shared.unload()
-                try await LocalModelInstaller.install(
-                    models: plan.models.map { ($0, LocalQuickScan.pinnedDigest($0)) }
-                ) { update in
-                    Task { @MainActor [weak self] in
-                        self?.installPhase = update.phase
-                        self?.installProgress = update.fraction
+                if LocalSemanticIndex.usesGemma {
+                    installPhase = "正在检查 AIE 内置 EmbeddingGemma 2…"
+                    try await LocalGemmaInstaller.install()
+                }
+                if !plan.models.isEmpty {
+                    try await LocalModelInstaller.install(
+                        models: plan.models.map { ($0, LocalQuickScan.pinnedDigest($0)) }
+                    ) { update in
+                        Task { @MainActor [weak self] in
+                            self?.installPhase = update.phase
+                            self?.installProgress = update.fraction
+                        }
                     }
                 }
                 await activate(plan)
@@ -351,8 +357,9 @@ enum DeviceSetupStep: Int, CaseIterable {
         let activated: Bool
         if let model = plan.visionModel {
             activated = await LocalQuickScan.shared.activate(model)
+                && (!LocalSemanticIndex.usesGemma || LocalGemmaWorker.isAvailable)
         } else {
-            activated = LocalModelLibrary.isInstalled(LocalScanPlan.embeddingModel)
+            activated = LocalGemmaWorker.isAvailable
         }
         installing = false
         guard activated else {
@@ -364,8 +371,8 @@ enum DeviceSetupStep: Int, CaseIterable {
         installProgress = 1
         installPhase = "本地模型已就绪"
         message = plan == .semantic
-            ? "已启用 Qwen3 Embedding 0.6B；语义索引会在后台继续，4B / 8B 内容理解未启用。"
-            : "已启用 Qwen3 Embedding 0.6B 与 \(LocalQuickScan.displayName)，内容分析会在后台继续。"
+            ? "已启用 EmbeddingGemma 2；语义索引会在后台继续，4B / 8B 内容理解未启用。"
+            : "已启用 EmbeddingGemma 2 与 \(LocalQuickScan.displayName)，内容分析会在后台继续。"
         NotificationCenter.default.post(name: ScanConfiguration.changed, object: nil)
         if !firstRun { close() }
     }

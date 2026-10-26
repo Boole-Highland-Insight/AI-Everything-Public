@@ -1,4 +1,6 @@
 import SwiftUI
+import AIEData
+import AppKit
 
 private enum SettingsPage: String, CaseIterable, Identifiable {
     case local
@@ -10,16 +12,29 @@ private enum SettingsPage: String, CaseIterable, Identifiable {
 private enum ScanStagePage: CaseIterable, Identifiable {
     case index
     case recognition
+    case semantic
     case understanding
 
     var id: Self { self }
 }
 
 struct APISettingsView: View {
+    @MainActor static let sharedProgress = IndexingProgressDisplay()
     @ObservedObject var model: SearchModel
     @ObservedObject private var scan = ScanProgress.shared
     @ObservedObject private var semantic = SemanticProgress.shared
-    @AppStorage(ScanConfiguration.allowIndexGrowthKey) private var allowIndexGrowth = false
+    @StateObject private var progress: IndexingProgressDisplay
+    private let observesProgress: Bool
+    init(model: SearchModel, progress: IndexingProgressDisplay? = nil,
+         observesProgress: Bool = true) {
+        self.model = model
+        self.observesProgress = observesProgress
+        _progress = StateObject(wrappedValue: progress ?? Self.sharedProgress)
+    }
+    @AppStorage(ScanConfiguration.planKey) private var scanPlan = "deep"
+    @AppStorage(ScanConfiguration.deepPausedKey) private var deepPaused = false
+    @State private var changingDeep = false
+    @State private var deepSettingError: String?
     @State private var draft = ""
     @State private var saved = false
     @State private var confirmDeepRescan = false
@@ -27,12 +42,23 @@ struct APISettingsView: View {
     @State private var selectedStage: ScanStagePage = .index
     @State private var editingKey = false
     @State private var showRecognitionFailures = false
+    @State private var recognitionSkipError: String?
+    @State private var showUnderstandingFailures = false
+    @State private var understandingSkipError: String?
     @State private var showQuality = false
+    @AppStorage("aie.search.automaticRerank") private var automaticRerank = false
     @State private var models: [APIConfiguration.Model: String] = Dictionary(
         uniqueKeysWithValues: APIConfiguration.Model.allCases.map { ($0, $0.id) }
     )
 
     var body: some View {
+        settingsContent
+        .task(id: progressRequest) {
+            if observesProgress { await progress.observe(roots: progressRoots, id: progressRequest) }
+        }
+    }
+
+    private var settingsContent: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
                 HStack {
@@ -79,6 +105,9 @@ struct APISettingsView: View {
             case .none: break
             }
         }
+        .onChange(of: semantic.phase) { _, phase in
+            if phase == .running { selectedStage = .semantic }
+        }
         .confirmationDialog(
             "重新扫描全部支持的文件？",
             isPresented: $confirmDeepRescan,
@@ -111,7 +140,7 @@ struct APISettingsView: View {
             selectedStageDetail
 
             HStack {
-                Label("搜索已可用", systemImage: "checkmark.circle.fill")
+                Label(counts(.index).ready > 0 ? "已有内容可搜索" : "正在准备基础索引", systemImage: "checkmark.circle.fill")
                     .font(.system(size: 11, weight: .medium))
                     .foregroundStyle(.secondary)
                 Spacer()
@@ -128,6 +157,8 @@ struct APISettingsView: View {
                     .controlSize(.small)
                 }
             }
+            Toggle("自动精排（BGE/Jev，会增加等待时间）", isOn: $automaticRerank)
+                .font(.system(size: 11))
         }
     }
 
@@ -189,7 +220,117 @@ struct APISettingsView: View {
         case .index: indexDetail
         case .recognition: recognitionDetail
         case .understanding: understandingDetail
+        case .semantic: semanticDetail
         }
+    }
+
+    private var deepUnderstandingControl: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            Toggle("后台深度理解（本地 8B）", isOn: Binding(
+                get: { scanPlan == LocalScanPlan.deep.rawValue },
+                set: { enabled in
+                    deepSettingError = nil
+                    if !enabled {
+                        ScanConfiguration.setBackgroundUnderstanding(false)
+                        return
+                    }
+                    changingDeep = true
+                    Task { @MainActor in
+                        let ready = await LocalQuickScan.shared.activate(LocalQuickScan.preferredModel)
+                        changingDeep = false
+                        if ready { ScanConfiguration.setBackgroundUnderstanding(true) }
+                        else { deepSettingError = "本地 8B 尚未安装，请在“深度理解 → 本机模型”中配置。" }
+                    }
+                }
+            )).toggleStyle(.switch).disabled(changingDeep)
+            HStack {
+                if !understandingFailedFiles.isEmpty {
+                    Button(deepStatus) {
+                        withAnimation { showUnderstandingFailures.toggle() }
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
+                } else {
+                    Text(deepStatus).foregroundStyle(.secondary)
+                }
+                Spacer()
+                if scanPlan == LocalScanPlan.deep.rawValue {
+                    Button(deepPaused ? "继续 8B" : "暂停 8B") {
+                        ScanConfiguration.pauseBackgroundUnderstanding(!deepPaused)
+                    }.buttonStyle(.borderless)
+                    if !understandingFailedFiles.isEmpty {
+                        Button("重试失败项") { model.retryDeepUnderstanding() }
+                            .disabled(deepPaused || scan.userPaused || scan.running)
+                    }
+                }
+            }.font(.system(size: 11))
+            if scanPlan == LocalScanPlan.deep.rawValue {
+                Text(progressLoaded ? "8B 文件分析：" + counts(.understanding).summary : "正在读取当前版本的 8B 分析状态")
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
+                if scan.active == .llm, let file = scan.currentFile {
+                    Text(file).lineLimit(1).font(.system(size: 10)).foregroundStyle(.secondary)
+                }
+            }
+            if let error = deepSettingError {
+                Text(error).font(.system(size: 11)).foregroundStyle(.orange)
+            }
+            Text("关闭或暂停后，当前文件安全收尾；已保存分析继续可搜，Gemma 基础索引不受影响。")
+                .font(.system(size: 10)).foregroundStyle(.secondary)
+        }
+    }
+
+    private var progressRoots: [String] {
+        model.roots.map { $0.standardizedFileURL.resolvingSymlinksInPath().path }.sorted()
+    }
+    private var progressRequest: String {
+        progressRoots.joined(separator: "\n")
+    }
+    private var progressLoaded: Bool { progress.matches(progressRequest) }
+    private var semanticLoaded: Bool { progress.semanticMatches(progressRequest) }
+    private var discovered: Int { progressRoots.isEmpty ? 0 : max(scan.catalogCount, model.files.count) }
+    private var parsingPending: Bool {
+        !progressLoaded || scan.catalogDiscovering || scan.indexing || scan.indexFailed
+            || !scan.catalogReady || !progress.count("index", discovered: discovered).settled
+    }
+    private func counts(_ stage: ScanStagePage) -> IndexingStageCount {
+        switch stage {
+        case .index: return progress.count("index", discovered: discovered)
+        case .recognition:
+            var value = progress.count("local", discovered: discovered)
+            value.pending = max(0, value.pending - recognitionSkippedFiles.filter { !$0.deferred }.count)
+            value.deferred = max(0, value.deferred - recognitionSkippedFiles.filter { $0.deferred }.count)
+            value.running = value.running || (scan.active == .local && scan.currentFile != nil && scan.running)
+            return value
+        case .understanding:
+            var value = progress.count("deep", discovered: discovered)
+            value.pending = max(0, value.pending - understandingSkippedFiles.filter { !$0.deferred }.count)
+            value.deferred = max(0, value.deferred - understandingSkippedFiles.filter { $0.deferred }.count)
+            value.running = value.running || (scan.active == .llm && scan.currentFile != nil && scan.running)
+            return value
+        case .semantic:
+            var value = progress.semanticCount
+            value.running = semantic.rootPaths == progressRoots && semantic.phase == .running
+            return value
+        }
+    }
+    private func upstreamPending(_ stage: ScanStagePage) -> Bool {
+        if stage == .semantic { return false }
+        if stage == .index { return scan.catalogDiscovering || scan.indexing || !scan.catalogReady }
+        if parsingPending { return true }
+        return stage == .understanding && !counts(.recognition).settled
+    }
+    private var deepStatus: String {
+        if changingDeep { return "正在检查本地模型" }
+        if scanPlan != LocalScanPlan.deep.rawValue {
+            return QuickScanner.isBusy ? "已关闭 · 当前任务正在收尾" : "未启用"
+        }
+        if deepPaused || scan.userPaused {
+            return QuickScanner.isBusy ? "暂停中 · 当前任务正在收尾" : "已暂停"
+        }
+        if !LocalQuickScan.isInstalled { return "等待中 · 本地模型未就绪" }
+        if scan.yieldingForSearch { return "等待中 · 优先响应搜索" }
+        return counts(.understanding).status(upstreamPending: upstreamPending(.understanding),
+                                            paused: false, loaded: progressLoaded)
     }
 
     private var indexDetail: some View {
@@ -200,22 +341,36 @@ struct APISettingsView: View {
             metricRow(
                 title: "全文索引",
                 icon: "text.magnifyingglass",
-                value: scan.indexTotal > 0 ? "\(scan.indexedFiles) / \(scan.indexTotal)" : "等待"
+                value: progressLoaded ? "已发现 \(discovered) · 已落库 \(counts(.index).ready)"
+                    : "已发现 \(discovered) · 已落库统计中"
             )
-            metricRow(title: "语义索引", icon: "point.3.connected.trianglepath.dotted", value: semanticSummary)
-            HStack {
-                Button("检查语义索引") { model.updateSemanticIndex(force: true) }
-                    .buttonStyle(.borderless)
-                Spacer()
-                Toggle("扩展容量", isOn: $allowIndexGrowth)
-                    .toggleStyle(.switch)
-                    .controlSize(.mini)
-                    .font(.system(size: 11))
-                    .onChange(of: allowIndexGrowth) { _, enabled in
-                        if enabled { model.updateSemanticIndex(force: true) }
-                    }
-            }
+            Text("提取文件名、路径和直接文本并建立全文索引；已完成部分可搜索。OCR 等识别结果就绪后继续补入，不代表所有页面均已覆盖。")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
         }
+    }
+
+    private var recognitionSkippedFiles: [FileScanStatus] {
+        guard progressLoaded else { return [] }
+        return progress.snapshot?.files.filter { $0.stages["local"]?.status == "skipped" } ?? []
+    }
+
+    private var recognitionSkippedCount: Int { recognitionSkippedFiles.count }
+
+    private var recognitionFailedFiles: [FileScanStatus] {
+        guard progressLoaded else { return [] }
+        return progress.snapshot?.files.filter {
+            ["failed", "empty", "limited", "needs_review"].contains($0.stages["local"]?.status ?? "")
+        } ?? []
+    }
+
+    private func skipRecognition(_ file: FileScanStatus) {
+        do {
+            let db = try AppDatabase.open()
+            try db.skipRecognitionTask(path: file.path, versionID: file.versionID, rootPaths: progressRoots)
+            progress.snapshot = try db.indexingFileSnapshot(rootPaths: progressRoots)
+            recognitionSkipError = nil
+        } catch { recognitionSkipError = "无法跳过：\(error)" }
     }
 
     private var recognitionDetail: some View {
@@ -223,8 +378,17 @@ struct APISettingsView: View {
             stageDetailHeader(.recognition)
             stageProgress(.recognition)
             HStack(spacing: 8) {
-                compactMetric(title: "剩余", value: "\(scan.localRemaining)", color: .secondary)
-                compactMetric(title: "失败", value: "\(scan.localFailed)", color: scan.localFailed > 0 ? warningAccent : Color.secondary)
+                compactMetric(title: "待处理", value: progressLoaded ? "\(counts(.recognition).pending)" : "统计中", color: .secondary)
+                compactMetric(title: "失败", value: progressLoaded ? "\(counts(.recognition).failed)" : "统计中", color: counts(.recognition).failed > 0 ? warningAccent : Color.secondary)
+                compactMetric(title: "已跳过", value: progressLoaded ? "\(recognitionSkippedCount)" : "统计中", color: .secondary)
+            }
+            Text(progressLoaded ? counts(.recognition).summary : "正在读取当前文件版本的识别状态")
+                .font(.system(size: 11)).foregroundStyle(.secondary)
+            Text("包含 OCR、视觉分类、文字分析及转录，按当前版本文件计数；PDF 识别不代表逐页全覆盖。")
+                .font(.system(size: 11)).foregroundStyle(.secondary)
+            if upstreamPending(.recognition) {
+                Text("文件解析仍在继续，待处理数量会增加。")
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
             }
             if let file = scan.currentFile, scan.active == .local {
                 Label(file, systemImage: "doc")
@@ -232,11 +396,31 @@ struct APISettingsView: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
-            if scan.localFailed > 0 {
+            if !recognitionFailedFiles.isEmpty {
                 DisclosureGroup("失败记录", isExpanded: $showRecognitionFailures) {
                     VStack(alignment: .leading, spacing: 6) {
-                        ForEach(Array(scan.failures.prefix(4)), id: \.self) { failure in
-                            Text(failure).lineLimit(2)
+                        ForEach(recognitionFailedFiles, id: \.versionID) { file in
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text(URL(fileURLWithPath: file.path).lastPathComponent)
+                                    .font(.system(size: 11, weight: .medium))
+                                    .foregroundStyle(.primary)
+                                    .lineLimit(1)
+                                    .help(file.relativePath)
+                                Text(file.stages["local"]?.error ?? "内容识别失败")
+                                    .lineLimit(2)
+                                    .help(file.stages["local"]?.error ?? "内容识别失败")
+                                HStack(spacing: 8) {
+                                    Button("打开文件") {
+                                        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: file.path)])
+                                    }
+                                    .help("在Finder中定位此文件")
+                                    Button("跳过") { skipRecognition(file) }
+                                        .help("跳过此文件当前版本的内容识别")
+                                }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
+                                .foregroundStyle(.primary)
+                            }
                         }
                     }
                     .font(.system(size: 10))
@@ -245,13 +429,81 @@ struct APISettingsView: View {
                 }
                 .font(.system(size: 11))
             }
+            if let recognitionSkipError {
+                Text(recognitionSkipError).font(.system(size: 11)).foregroundStyle(.orange)
+            }
         }
+    }
+
+    private var understandingSkippedFiles: [FileScanStatus] {
+        guard progressLoaded else { return [] }
+        return progress.snapshot?.files.filter { $0.stages["deep"]?.status == "skipped" } ?? []
+    }
+
+    private var understandingSkippedCount: Int { understandingSkippedFiles.count }
+
+    private var understandingFailedFiles: [FileScanStatus] {
+        guard progressLoaded else { return [] }
+        return progress.snapshot?.files.filter {
+            ["failed", "empty", "limited", "needs_review"].contains($0.stages["deep"]?.status ?? "")
+        } ?? []
+    }
+
+    private func skipUnderstanding(_ file: FileScanStatus) {
+        do {
+            let db = try AppDatabase.open()
+            try db.skipDeepUnderstandingTask(path: file.path, versionID: file.versionID, rootPaths: progressRoots)
+            progress.snapshot = try db.indexingFileSnapshot(rootPaths: progressRoots)
+            understandingSkipError = nil
+        } catch { understandingSkipError = "无法跳过：\(error)" }
     }
 
     private var understandingDetail: some View {
         detailCard {
             stageDetailHeader(.understanding)
             stageProgress(.understanding)
+            deepUnderstandingControl
+
+            if !understandingFailedFiles.isEmpty {
+                DisclosureGroup("失败记录", isExpanded: $showUnderstandingFailures) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        ForEach(understandingFailedFiles, id: \.versionID) { file in
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text(URL(fileURLWithPath: file.path).lastPathComponent)
+                                    .font(.system(size: 11, weight: .medium))
+                                    .foregroundStyle(.primary)
+                                    .lineLimit(1)
+                                    .help(file.relativePath)
+                                Text(file.stages["deep"]?.error ?? "8B深度理解失败")
+                                    .lineLimit(2)
+                                    .help(file.stages["deep"]?.error ?? "8B深度理解失败")
+                                HStack(spacing: 8) {
+                                    Button("打开文件") {
+                                        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: file.path)])
+                                    }
+                                    .help("在Finder中定位此文件")
+                                    Button("跳过") { skipUnderstanding(file) }
+                                        .help("仅跳过此文件当前版本的8B深度理解")
+                                }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
+                                .foregroundStyle(.primary)
+                            }
+                        }
+                    }
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                    .padding(.top, 5)
+                }
+                .font(.system(size: 11))
+            }
+            if understandingSkippedCount > 0 {
+                Text("已跳过 \(understandingSkippedCount) 项8B深度理解")
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
+            }
+            if let understandingSkipError {
+                Text(understandingSkipError).font(.system(size: 11)).foregroundStyle(.orange)
+            }
 
             Button { DeviceSetup.shared.present() } label: {
                 HStack(spacing: 9) {
@@ -303,6 +555,25 @@ struct APISettingsView: View {
                     )
             }
             .controlSize(.small)
+        }
+    }
+
+    private var semanticDetail: some View {
+        detailCard {
+            stageDetailHeader(.semantic)
+            stageProgress(.semantic)
+            metricRow(
+                title: "语义索引进度",
+                icon: "point.3.connected.trianglepath.dotted",
+                value: semanticSummary
+            )
+            Text(upstreamPending(.semantic)
+                 ? "Gemma 编码原文、转录和视觉内容。上游仍在产生新内容，向量目标总数会增加；已有向量可搜索。"
+                 : "Gemma 向量目标：已完成 \(counts(.semantic).ready)，待完成 \(counts(.semantic).pending)，失败 \(counts(.semantic).failed)。此计数不是 8B 文件分析进度。")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+            Button("检查语义索引") { model.updateSemanticIndex(force: true) }
+                .buttonStyle(.borderless)
         }
     }
 
@@ -539,48 +810,42 @@ struct APISettingsView: View {
     private var cloudModelRoles: [APIConfiguration.Model] { [.scan, .reuse, .image] }
 
     private var scanStatusText: String {
+        if progress.failed || scan.indexFailed { return "需检查" }
         if scan.userPaused { return "已暂停" }
-        if scan.indexFailed { return "需处理" }
-        if scan.indexing { return "索引中" }
-        if scan.active == .local { return "识别中" }
-        if scan.active == .llm { return "理解中" }
-        if scanPreparing { return "准备中" }
-        return scan.running ? "运行中" : "已完成"
+        if scan.catalogDiscovering { return "发现文件中" }
+        if parsingPending { return "解析中" }
+        if !counts(.recognition).settled { return "识别待完成" }
+        if ScanConfiguration.semanticEnabled(), !semanticLoaded || !counts(.semantic).settled { return "语义索引中" }
+        return scanPlan == "deep" && !counts(.understanding).settled ? "基础搜索就绪" : "已就绪"
     }
-
     private var scanStatusColor: Color {
-        if scan.userPaused || scan.indexFailed { return warningAccent }
-        if scan.indexing || scan.running || scanPreparing { return localAccent }
+        if progress.failed || scan.indexFailed || scan.userPaused { return warningAccent }
+        if parsingPending || !counts(.recognition).settled
+            || (ScanConfiguration.semanticEnabled() && (!semanticLoaded || !counts(.semantic).settled)) { return localAccent }
         return successAccent
     }
-
     private var scanDetailText: String {
-        if scan.indexing { return "\(scan.indexedFiles) / \(scan.indexTotal) 个文件" }
-        if scan.active == .local { return "剩余 \(scan.localRemaining) 项" }
-        if scan.active == .llm { return "剩余 \(scan.llmRemaining) 项" }
-        if scanPreparing { return "正在准备任务" }
-        return scan.catalogCount > 0 ? "\(scan.catalogCount) 个文件" : "等待文件"
+        if scan.catalogDiscovering { return "正在发现文件" }
+        return progressLoaded ? "已发现 \(discovered) · 基础索引 \(counts(.index).ready)"
+            : "已发现 \(discovered) · 基础索引统计中"
     }
-
-    private var scanPreparing: Bool {
-        !scan.userPaused && !scan.indexFailed && !scan.indexing
-            && scan.indexTotal > 0 && scan.indexFraction >= 0.999
-            && scan.localTotal == 0
-    }
+    private var scanPreparing: Bool { !progressLoaded || parsingPending || !counts(.recognition).settled || (ScanConfiguration.semanticEnabled() && (!semanticLoaded || !counts(.semantic).settled)) }
 
     private func followActiveStage() {
         if scan.indexing { selectedStage = .index }
         else if scan.active == .local { selectedStage = .recognition }
         else if scan.active == .llm { selectedStage = .understanding }
+        else if semantic.phase == .running || semantic.total > 0 { selectedStage = .semantic }
         else if scan.llmTotal > 0 { selectedStage = .understanding }
         else if scan.localTotal > 0 { selectedStage = .recognition }
     }
 
     private func stageTitle(_ stage: ScanStagePage) -> String {
         switch stage {
-        case .index: return "内容索引"
-        case .recognition: return "文字识别"
+        case .index: return "文件解析"
+        case .recognition: return "内容识别"
         case .understanding: return "深度理解"
+        case .semantic: return "语义索引"
         }
     }
 
@@ -589,39 +854,34 @@ struct APISettingsView: View {
         case .index: return "doc.text.magnifyingglass"
         case .recognition: return "viewfinder"
         case .understanding: return "sparkles"
+        case .semantic: return "point.3.connected.trianglepath.dotted"
         }
     }
 
     private func stageFraction(_ stage: ScanStagePage) -> Double {
-        switch stage {
-        case .index: return scan.indexFraction
-        case .recognition: return scan.localFraction
-        case .understanding: return scan.llmFraction
+        guard stage == .semantic ? semanticLoaded : progressLoaded else { return 0 }
+        if stage == .recognition || (stage == .understanding && understandingSkippedCount > 0) {
+            let value = counts(stage)
+            let skipped = stage == .recognition ? recognitionSkippedCount : understandingSkippedCount
+            let total = value.total + skipped
+            let fraction = total > 0 ? Double(value.ready + skipped) / Double(total) : 0
+            return stageCompleted(stage) ? fraction : min(0.99, fraction)
         }
+        let fraction = counts(stage).fraction
+        return stageCompleted(stage) ? fraction : min(0.99, fraction)
     }
-
     private func stagePercent(_ stage: ScanStagePage) -> Int {
-        switch stage {
-        case .index: return scan.indexPercent
-        case .recognition: return scan.localPercent
-        case .understanding: return scan.llmPercent
-        }
+        min(stageCompleted(stage) ? 100 : 99, Int((stageFraction(stage) * 100).rounded(.down)))
     }
-
     private func stageTotal(_ stage: ScanStagePage) -> Int {
-        switch stage {
-        case .index: return scan.indexTotal
-        case .recognition: return scan.localTotal
-        case .understanding: return scan.llmTotal
-        }
+        if stage == .recognition { return counts(stage).total + recognitionSkippedCount }
+        if stage == .understanding { return counts(stage).total + understandingSkippedCount }
+        return stage == .index ? discovered : counts(stage).total
     }
-
     private func stageFailed(_ stage: ScanStagePage) -> Int {
-        switch stage {
-        case .index: return scan.indexFailed ? 1 : 0
-        case .recognition: return scan.localFailed
-        case .understanding: return scan.llmFailed
-        }
+        if stage == .index && scan.indexFailed { return max(1, counts(stage).failed) }
+        if stage == .semantic && semantic.rootPaths == progressRoots && semantic.phase == .unavailable { return max(1, counts(stage).failed) }
+        return counts(stage).failed
     }
 
     private func stageActive(_ stage: ScanStagePage) -> Bool {
@@ -629,28 +889,44 @@ struct APISettingsView: View {
         case .index: return scan.indexing
         case .recognition: return scan.active == .local
         case .understanding: return scan.active == .llm
+        case .semantic: return semantic.phase == .running
         }
     }
 
     private func stageDisabled(_ stage: ScanStagePage) -> Bool {
-        stage == .understanding
-            && (!ScanConfiguration.visionEnabled() || !LocalQuickScan.isInstalled)
+        switch stage {
+        case .understanding:
+            return !ScanConfiguration.visionEnabled() || !LocalQuickScan.isInstalled
+        case .semantic:
+            return !ScanConfiguration.semanticEnabled()
+        default:
+            return false
+        }
     }
 
     private func stageCompleted(_ stage: ScanStagePage) -> Bool {
-        stageTotal(stage) > 0 && stageFraction(stage) >= 0.999 && stageFailed(stage) == 0
+        (stage == .semantic ? semanticLoaded : progressLoaded) && !stageDisabled(stage) && !upstreamPending(stage)
+            && (counts(stage).total > 0 || (stage == .recognition && recognitionSkippedCount > 0)
+                || (stage == .understanding && understandingSkippedCount > 0))
+            && counts(stage).settled && stageFailed(stage) == 0
+            && !(stage == .understanding && deepPaused)
     }
-
     private func stageStatus(_ stage: ScanStagePage) -> String {
+        if stage == .understanding { return deepStatus }
         if stageDisabled(stage) { return "未启用" }
-        if stage == .index, scan.indexFailed { return "失败" }
-        if stageTotal(stage) == 0 { return "等待" }
-        if stageCompleted(stage) { return "完成" }
-        return "\(stagePercent(stage))%"
+        if stage == .recognition && progressLoaded && counts(stage).running { return "处理中" }
+        if (stage != .semantic && progress.failed) || stageFailed(stage) > 0 { return "需检查" }
+        if stage == .semantic && stageCompleted(stage) { return "100% · 已完成" }
+        if stage == .recognition && stageCompleted(stage) { return "100% · 已完成" }
+        if stage == .index, scan.catalogDiscovering { return "发现中" }
+        if stage == .index, scan.indexing { return progressLoaded ? "\(stagePercent(stage))%" : "统计中" }
+        return counts(stage).status(upstreamPending: upstreamPending(stage),
+                                    paused: scan.userPaused, loaded: stage == .semantic ? semanticLoaded : progressLoaded)
     }
 
     private func stageColor(_ stage: ScanStagePage) -> Color {
-        if stage == .index, scan.indexFailed { return warningAccent }
+        if stageDisabled(stage) { return .secondary }
+        if stageFailed(stage) > 0 || progress.failed { return warningAccent }
         if stageCompleted(stage) { return successAccent }
         if stageActive(stage) { return localAccent }
         return .secondary
@@ -684,7 +960,16 @@ struct APISettingsView: View {
                     .font(.system(size: 10, weight: .medium))
                     .foregroundStyle(warningAccent)
             }
-            Text(stageStatus(stage))
+            Group {
+                if stage == .understanding, !understandingFailedFiles.isEmpty {
+                    Button(stageStatus(stage)) {
+                        withAnimation { showUnderstandingFailures.toggle() }
+                    }
+                    .buttonStyle(.plain)
+                } else {
+                    Text(stageStatus(stage))
+                }
+            }
                 .font(.system(size: 11, weight: .medium, design: .rounded))
                 .monospacedDigit()
                 .foregroundStyle(stageColor(stage))
@@ -729,10 +1014,9 @@ struct APISettingsView: View {
     }
 
     private var semanticSummary: String {
-        let value = semantic.text
-        if value == "语义索引待检查" { return "待检查" }
-        if value.hasPrefix("语义索引 ") { return String(value.dropFirst("语义索引 ".count)) }
-        return value
+        guard semanticLoaded else { return "统计中" }
+        let value = counts(.semantic)
+        return "\(value.ready.formatted()) / \(value.total.formatted())"
     }
 
     private var summaryIssueFiles: [IndexedFile] {

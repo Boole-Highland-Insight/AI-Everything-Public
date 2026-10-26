@@ -1,10 +1,9 @@
 #!/bin/bash
 set -euo pipefail
 AIE_PROJECT="$(cd "$(dirname "$0")/.." && pwd)"
-SUITE="${1:?Usage: evaluate_search.sh /path/to/suite.json [mode]}"
+SUITE="${1:-$AIE_PROJECT/tests/SearchEvaluationBaseline.json}"
 MODE="${2:-}"
-: "${AIE_LIBRARY_ROOT:?Set AIE_LIBRARY_ROOT to the library matching your evaluation suite}"
-export AIE_LIBRARY_ROOT
+export AIE_LIBRARY_ROOT="${AIE_LIBRARY_ROOT:-$HOME/Documents/AI-Everything-Library}"
 EVAL_SCRATCH=""
 if [ -z "${AIE_DATABASE_PATH:-}" ]; then
   PRODUCTION_DATABASE="$HOME/Library/Application Support/AI Everything/Index/content.sqlite"

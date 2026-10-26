@@ -3,7 +3,6 @@ import Foundation
 enum LocalScanPlan: String, CaseIterable, Identifiable {
     case semantic, balanced, deep
     var id: String { rawValue }
-    static let embeddingModel = "qwen3-embedding:0.6b"
     var title: String {
         switch self {
         case .semantic: return "语义索引"
@@ -13,7 +12,7 @@ enum LocalScanPlan: String, CaseIterable, Identifiable {
     }
     var subtitle: String {
         switch self {
-        case .semantic: return "按含义搜索正文与 OCR 文字，不生成图片描述"
+        case .semantic: return "Gemma 索引原文、OCR 和图片；复用已有分析，不运行新的 8B 分析"
         case .balanced: return "加入 4B 模型，生成内容摘要与图片描述"
         case .deep: return "使用 8B 模型分析内容，占用更多内存与扫描时间"
         }
@@ -25,7 +24,9 @@ enum LocalScanPlan: String, CaseIterable, Identifiable {
         case .deep: return "qwen3-vl:8b-instruct-q4_K_M"
         }
     }
-    var models: [String] { [Self.embeddingModel] + [visionModel].compactMap { $0 } }
+    var models: [String] {
+        [visionModel].compactMap { $0 }
+    }
     var requiredFreeGB: Int {
         switch self {
         case .semantic: return 2
@@ -40,6 +41,26 @@ enum ScanConfiguration {
     static let changed = Notification.Name("aie.scanConfigurationChanged")
     static let planKey = "aie.scan.plan"
     static let pendingKey = "aie.scan.installPending"
+    static let deepPausedKey = "aie.scan.deepPaused"
+    static func initialPlan(in defaults: UserDefaults = .standard) -> LocalScanPlan {
+        defaults.string(forKey: planKey).flatMap(LocalScanPlan.init(rawValue:)) ?? .deep
+    }
+    static func backgroundUnderstandingEnabled(in defaults: UserDefaults = .standard) -> Bool {
+        defaults.string(forKey: planKey) == LocalScanPlan.deep.rawValue
+    }
+    static func backgroundUnderstandingCanRun(in defaults: UserDefaults = .standard) -> Bool {
+        visionEnabled(in: defaults) && !defaults.bool(forKey: deepPausedKey)
+    }
+    /// A daily setting change does not install models or rebuild the content index.
+    static func setBackgroundUnderstanding(_ enabled: Bool, in defaults: UserDefaults = .standard) {
+        select(enabled ? LocalScanPlan.deep.rawValue : LocalScanPlan.semantic.rawValue, pending: false, in: defaults)
+        defaults.set(false, forKey: deepPausedKey)
+        NotificationCenter.default.post(name: changed, object: nil, userInfo: ["backgroundOnly": true])
+    }
+    static func pauseBackgroundUnderstanding(_ paused: Bool, in defaults: UserDefaults = .standard) {
+        defaults.set(paused, forKey: deepPausedKey)
+        NotificationCenter.default.post(name: changed, object: nil, userInfo: ["backgroundOnly": true])
+    }
     static let allowIndexGrowthKey = "aie.index.allowBeyondSoftLimit"
     static func semanticEnabled(in defaults: UserDefaults = .standard) -> Bool {
         // Keep the old model-free choice disabled until the user explicitly picks a new plan.

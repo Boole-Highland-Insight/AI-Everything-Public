@@ -1,5 +1,8 @@
 import Foundation
 import AIEData
+import AppKit
+import SwiftUI
+import Combine
 
 struct SearchEvaluationSuite: Decodable {
     let version: Int
@@ -55,6 +58,12 @@ struct SearchExpectedLocation: Decodable {
     let endSeconds: Double?
 }
 
+struct SearchEvaluationRankedFile: Encodable {
+    let rank: Int
+    let fileID: String?
+    let path: String
+}
+
 struct SearchEvaluationCaseResult: Encodable {
     let id: String
     let query: String
@@ -74,6 +83,7 @@ struct SearchEvaluationCaseResult: Encodable {
     let jevErrors: Int
     let jevInputTokens: Int
     let returned: [String]
+    let top30: [SearchEvaluationRankedFile]
     let missingRequired: [String]
     let forbidden: [String]
     let missingDirect: [String]
@@ -128,7 +138,8 @@ enum SearchEvaluation {
     static func report(
         suite: SearchEvaluationSuite,
         mode: String,
-        results: [(SearchEvaluationCase, SearchEvaluationQueryResult, Double)]
+        results: [(SearchEvaluationCase, SearchEvaluationQueryResult, Double)],
+        fileIDsByPath: [String: String] = [:]
     ) -> SearchEvaluationReport {
         var caseResults: [SearchEvaluationCaseResult] = []
         var relevantTop5 = 0
@@ -187,7 +198,7 @@ enum SearchEvaluation {
             jevOutputTokens += execution.jevOutputTokens
             jevCostUSD += execution.jevCostUSD
             let top20 = Array(hits.prefix(20))
-            let returned = top20.map(\.relative)
+            let returned = Array(hits.prefix(30)).map(\.relative)
             let relevant = Set(test.mustAppear + test.mayAppear)
             relevantTop5 += top20.prefix(5).filter { relevant.contains($0.relative) }.count
             relevantTop10 += top20.prefix(10).filter { relevant.contains($0.relative) }.count
@@ -197,7 +208,7 @@ enum SearchEvaluation {
                 rankedCases += 1
                 if let first = top20.first, relevant.contains(first.relative) { top1Hits += 1 }
             }
-            let found = Set(returned)
+            let found = Set(top20.map(\.relative))
             let missingRequired = test.mustAppear.filter { !found.contains($0) }
             requiredFound += test.mustAppear.count - missingRequired.count
             requiredTotal += test.mustAppear.count
@@ -257,7 +268,12 @@ enum SearchEvaluation {
                 jevRequests: execution.jevRequests,
                 jevErrors: execution.jevErrors,
                 jevInputTokens: execution.jevInputTokens,
-                returned: returned, missingRequired: missingRequired, forbidden: forbidden,
+                returned: returned,
+                top30: hits.prefix(30).enumerated().map {
+                    SearchEvaluationRankedFile(rank: $0.offset + 1,
+                        fileID: fileIDsByPath[$0.element.path], path: $0.element.path)
+                },
+                missingRequired: missingRequired, forbidden: forbidden,
                 missingDirect: missingDirect, wrongLocations: wrongLocations,
                 reciprocalRank: top20.firstIndex(where: { relevant.contains($0.relative) })
                     .map { 1.0 / Double($0 + 1) } ?? 0
@@ -338,6 +354,7 @@ private enum SearchEvaluationMode: String {
     case planned
     case precision
     case jev
+    case bge
     case fair
     case local
     case decisionAB = "decision-ab"
@@ -444,8 +461,28 @@ private struct PrecisionDraft {
 
 private enum SearchEvaluationPipeline {
     static func run(
-        mode: SearchEvaluationMode, query: String, files: [IndexedFile], roots: [String]
+        mode: SearchEvaluationMode, query: String, files: [IndexedFile], roots: [String],
+        resultLimit: Int = 20
     ) async -> SearchEvaluationQueryResult {
+        if mode == .hybrid && resultLimit == 30 {
+            let gateway = LibrarySearchStageRecorder()
+            guard SearchRouter.route(query).uses(.semantic) else {
+                let lexical = LibraryGateway.search(query: query, in: files, limit: 30, recorder: gateway)
+                return SearchEvaluationQueryResult(hits: lexical, semantic: nil, gateway: gateway,
+                    modelCallsAttempted: 0, modelCallsCompleted: 0)
+            }
+            async let profile = LocalSemanticIndex.shared.searchProfiled(
+                query: query, roots: roots, minScore: LocalRerank.precisionWideMinScore,
+                candidateLimit: files.count <= 200 && LocalSemanticIndex.usesGemma ? 1000 : nil)
+            let lexical = LibraryGateway.searchCandidates(query: query, in: files).map(\.hit)
+            let semantic = await profile
+            let hybrid = LibraryGateway.search(query: query, in: files, semantic: semantic.results,
+                limit: 30, recorder: gateway)
+            return SearchEvaluationQueryResult(
+                hits: Array(SearchResultMerge.merge(lexical: lexical, semantic: hybrid).prefix(30)),
+                semantic: semantic, gateway: gateway,
+                modelCallsAttempted: 0, modelCallsCompleted: 0)
+        }
         let semanticProfile = mode.usesSemantic
             ? await LocalSemanticIndex.shared.searchProfiled(query: query, roots: roots)
             : nil
@@ -453,7 +490,7 @@ private enum SearchEvaluationPipeline {
         let gateway = LibrarySearchStageRecorder()
         let fast = LibraryGateway.search(
             query: query, in: files, semantic: semantic,
-            limit: mode == .jev ? JevRerank.candidateLimit : 20,
+            limit: mode == .jev || mode == .bge ? JevRerank.candidateLimit : resultLimit,
             recorder: gateway
         )
         if mode.usesModel, !SearchRouter.route(query).uses(.modelPlan) {
@@ -483,6 +520,11 @@ private enum SearchEvaluationPipeline {
                 query: query, files: files, semanticProfile: semanticProfile,
                 gateway: gateway, fast: fast
             )
+        case .bge:
+            return await bge(
+                query: query, files: files, semanticProfile: semanticProfile,
+                gateway: gateway, fast: fast
+            )
         case .fair, .local, .decisionAB:
             return SearchEvaluationQueryResult(
                 hits: fast, semantic: semanticProfile, gateway: gateway,
@@ -507,6 +549,22 @@ private enum SearchEvaluationPipeline {
             jevRequests: outcome.requests, jevErrors: outcome.errors,
             jevInputTokens: outcome.inputTokens, jevOutputTokens: outcome.outputTokens,
             jevCostUSD: outcome.costUSD
+        )
+    }
+
+    private static func bge(
+        query: String, files: [IndexedFile], semanticProfile: SemanticSearchProfile?,
+        gateway: LibrarySearchStageRecorder, fast: [FileHit]
+    ) async -> SearchEvaluationQueryResult {
+        let started = ProcessInfo.processInfo.systemUptime
+        let ranked = await LocalBGERerank.rerank(query: query, hits: fast, files: files) ?? fast
+        return SearchEvaluationQueryResult(
+            hits: ranked, semantic: semanticProfile, gateway: gateway,
+            modelCallsAttempted: fast.isEmpty ? 0 : 1,
+            modelCallsCompleted: fast.isEmpty ? 0 : 1,
+            extraStages: [
+                "bge.total": (ProcessInfo.processInfo.systemUptime - started) * 1_000
+            ]
         )
     }
 
@@ -962,18 +1020,112 @@ private enum SearchEvaluationPipeline {
     }
 }
 
+private enum SearchEnhancementComparison {
+    @MainActor static func run(suite: SearchEvaluationSuite, files: [IndexedFile], roots: [URL]) async throws -> [[String: Any]] {
+        guard AIEApplicationPaths.isCleanV2, ArchitectureAuditTrace.enabled, LocalBGERerank.isAvailable else {
+            throw DataLayerError.invalidDocument("Enhancement comparison requires audit timing and the existing local BGE runtime")
+        }
+        try await LocalSemanticIndex.shared.prepareSearch(roots: roots.map(\.path))
+        await LocalSemanticIndex.shared.warmUp()
+        guard let file = files.first else { throw DataLayerError.invalidDocument("Empty indexed snapshot") }
+        let warmHit = FileHit(path: file.path, name: file.name, relative: file.relative, kind: file.kind,
+            ext: file.ext, mtime: file.mtime, reason: "warmup", score: 0,
+            snippet: String(file.preview.prefix(800)), highlights: [], thumbPath: file.thumbPath,
+            uploadedToCloud: file.uploadedToCloud)
+        fputs("Warming existing local BGE model (excluded from measurements)\n", stderr)
+        guard await LocalBGERerank.rerank(query: "预热", hits: [warmHit], files: files,
+            candidateLimit: 1, timeout: 60) != nil else {
+            throw DataLayerError.invalidDocument("Existing local BGE model failed to warm up")
+        }
+        let model = SearchModel(indexedFiles: files, roots: roots)
+        let window = NSWindow(contentRect: NSRect(x: 80, y: 80, width: 620, height: 500),
+            styleMask: [.titled], backing: .buffered, defer: false)
+        window.title = "AIE · 只读搜索评估"
+        window.isReleasedWhenClosed = false
+        window.contentView = NSHostingView(rootView: SearchPanelView(model: model, onDismiss: {}))
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        defer { window.close() }
+        try await Task.sleep(nanoseconds: 200_000_000)
+        let fileIDs = Dictionary(uniqueKeysWithValues: files.compactMap { file in file.fileID.map { (file.path, $0) } })
+        func rankedRows(_ hits: [FileHit]) -> [[String: Any]] {
+            hits.enumerated().map { ["rank": $0.offset + 1, "fileID": fileIDs[$0.element.path] ?? "",
+                "path": $0.element.path, "chunkID": $0.element.chunkID as Any? ?? NSNull(),
+                "page": $0.element.page as Any? ?? NSNull(),
+                "startSeconds": $0.element.startSeconds as Any? ?? NSNull()] }
+        }
+        var rows: [[String: Any]] = []
+        for round in 0..<3 {
+            let orders = [[0, 3, 5, 10], [5, 10, 0, 3], [10, 3, 5, 0]]
+            for test in suite.cases {
+                for topN in orders[round] {
+                    model.query = ""
+                    try await Task.sleep(nanoseconds: 20_000_000)
+                    UserDefaults.standard.setVolatileDomain([
+                        ScanConfiguration.planKey: LocalScanPlan.semantic.rawValue,
+                        ScanConfiguration.pendingKey: false, "aie.scan.userPaused": true,
+                        ScanConfiguration.deepPausedKey: true,
+                        "aie.search.automaticRerank": topN > 0,
+                        DeepScanSearchEnhancement.topNKey: topN,
+                    ], forName: UserDefaults.argumentDomain)
+                    var v1: [FileHit] = [], captured = false, sawFastSearch = false
+                    let searching = model.$fastSearching.sink { if $0 { sawFastSearch = true } }
+                    let observation = model.$hits.sink { hits in
+                        if sawFastSearch, !captured, model.hasActiveQuery, !model.fastSearching, !model.reranking {
+                            captured = true; v1 = hits
+                        }
+                    }
+                    let previous = model.lastSearchTrace?.id
+                    let started = ProcessInfo.processInfo.systemUptime
+                    model.query = test.query
+                    while model.searchInProgress || model.lastSearchTrace?.id == previous {
+                        guard ProcessInfo.processInfo.systemUptime - started < 35 else {
+                            model.query = ""; observation.cancel(); searching.cancel()
+                            throw DataLayerError.invalidDocument("UI evaluation timed out: " + test.id)
+                        }
+                        try await Task.sleep(nanoseconds: 5_000_000)
+                    }
+                    observation.cancel()
+                    searching.cancel()
+                    try await Task.sleep(nanoseconds: 35_000_000)
+                    guard captured, let trace = model.lastSearchTrace else {
+                        throw DataLayerError.invalidDocument("Missing V1 publication: " + test.id)
+                    }
+                    rows.append(["round": round + 1, "id": test.id, "query": test.query, "topN": topN,
+                        "traceID": trace.id.uuidString, "v1": rankedRows(v1), "final": rankedRows(model.hits),
+                        "trace": try JSONSerialization.jsonObject(with: JSONEncoder().encode(trace))])
+                    fputs("[\(rows.count)/\(suite.cases.count * 12)] round \(round + 1) \(test.id) Top\(topN) done\n", stderr)
+                    fflush(stderr)
+                }
+            }
+        }
+        model.query = ""
+        // Exercise timeout rejection without starting a worker or publishing an alternative order.
+        guard await LocalBGERerank.rerank(query: "timeout check", hits: [warmHit], files: files,
+            candidateLimit: 1, timeout: 0) == nil else {
+            throw DataLayerError.invalidDocument("BGE accepted an expired deadline")
+        }
+        await LocalGemmaWorker.shared.stop()
+        ArchitectureAuditTrace.flush()
+        return rows
+    }
+}
+
 enum SearchEvaluationDiagnostics {
     static func runIfRequested() -> Bool {
         let arguments = CommandLine.arguments
-        guard arguments.dropFirst().first == "--evaluate-search" else { return false }
+        let readOnly = arguments.dropFirst().first == "--evaluate-search-readonly"
+        guard readOnly || arguments.dropFirst().first == "--evaluate-search" else { return false }
         guard ProcessInfo.processInfo.environment["AIE_DATABASE_PATH"] != nil else {
-            fputs("Search evaluation requires an isolated AIE_DATABASE_PATH; use tools/evaluate_search.sh.\n", stderr)
+            fputs(readOnly ? "Set AIE_DATABASE_PATH to the existing database for read-only evaluation.\n"
+                : "Search evaluation requires an isolated AIE_DATABASE_PATH; use tools/evaluate_search.sh.\n", stderr)
             exit(2)
         }
         guard (3...4).contains(arguments.count) else {
             fputs(
-                "usage: AIEPopup --evaluate-search /path/to/search-evaluation.json "
-                    + "[fast|hybrid|planned|precision|jev|fair|local|decision-ab]\n",
+                readOnly ? "usage: AIEPopup --evaluate-search-readonly SUITE [fast|hybrid|deepscan|enhancement|check-only]\n"
+                    : "usage: AIEPopup --evaluate-search /path/to/search-evaluation.json "
+                        + "[fast|hybrid|planned|precision|jev|fair|local|decision-ab]\n",
                 stderr
             )
             exit(2)
@@ -992,8 +1144,13 @@ enum SearchEvaluationDiagnostics {
             exit(2)
         }
         let defaultMode: SearchEvaluationMode = suite.includeSemantic ? .hybrid : .fast
+        let initializeOnly = readOnly && arguments.count == 4 && arguments[3] == "check-only"
+        let deepScanOnly = readOnly && arguments.count == 4 && arguments[3] == "deepscan"
+        let enhancementComparison = readOnly && arguments.count == 4 && arguments[3] == "enhancement"
         let mode: SearchEvaluationMode
-        if arguments.count == 4 {
+        if initializeOnly || deepScanOnly || enhancementComparison {
+            mode = .fast
+        } else if arguments.count == 4 {
             guard let requested = SearchEvaluationMode(rawValue: arguments[3]) else {
                 fputs("Unknown search evaluation mode: \(arguments[3])\n", stderr)
                 exit(2)
@@ -1001,6 +1158,10 @@ enum SearchEvaluationDiagnostics {
             mode = requested
         } else {
             mode = defaultMode
+        }
+        if readOnly && mode != .fast && mode != .hybrid {
+            fputs("Read-only evaluation supports fast, hybrid or check-only; model rerank modes are not enabled.\n", stderr)
+            exit(2)
         }
         if mode.usesModel, !LocalRerank.isAvailable {
             fputs("The local 8B model is unavailable; install or enable it before evaluation\n", stderr)
@@ -1019,24 +1180,101 @@ enum SearchEvaluationDiagnostics {
             exit(2)
         }
 
-        Task { @MainActor in
-            let roots: [URL]
-            if let path = ProcessInfo.processInfo.environment["AIE_LIBRARY_ROOT"], !path.isEmpty {
-                roots = [URL(fileURLWithPath: path, isDirectory: true)]
-            } else {
-                roots = LibraryRoots.load()
-            }
-            guard !roots.isEmpty else {
-                fputs("No library root configured; set AIE_LIBRARY_ROOT for CLI evaluation\n", stderr)
+        let roots: [URL]
+        if readOnly, let value = ProcessInfo.processInfo.environment["AIE_EVALUATION_ROOTS"] {
+            do {
+                roots = try JSONDecoder().decode([String].self, from: Data(value.utf8))
+                    .map { URL(fileURLWithPath: $0, isDirectory: true) }
+            } catch {
+                fputs("Invalid read-only evaluation roots: \(error)\n", stderr)
                 exit(2)
             }
-            let files = LibraryGateway.load(roots: roots)
+        } else if let path = ProcessInfo.processInfo.environment["AIE_LIBRARY_ROOT"], !path.isEmpty {
+            roots = [URL(fileURLWithPath: path, isDirectory: true)]
+        } else {
+            roots = LibraryRoots.load()
+        }
+        guard !roots.isEmpty else {
+            fputs("No library root configured; set AIE_LIBRARY_ROOT for CLI evaluation\n", stderr)
+            exit(2)
+        }
+        Task { @MainActor in
+            let files: [IndexedFile]
+            if readOnly {
+                do {
+                    let database = try AppDatabase.open(readOnly: true)
+                    try database.verifyReadOnlyAccess()
+                    files = try LibraryGateway.loadIndexedSnapshot(roots: roots)
+                    if initializeOnly {
+                        let report: [String: Any] = [
+                            "readOnly": database.isReadOnly, "writeRejected": true,
+                            "writeProbeResult": "SQLITE_READONLY", "files": files.count,
+                            "fileIDsPresent": files.allSatisfy { $0.fileID != nil && $0.versionID != nil },
+                            "chunks": files.reduce(0) { $0 + $1.chunks.count },
+                            "suiteCases": suite.cases.count, "queriesExecuted": 0,
+                            "gemmaAvailable": LocalGemmaWorker.isAvailable,
+                            "resourcePath": Bundle.main.resourceURL?.path ?? "",
+                        ]
+                        print(String(decoding: try JSONSerialization.data(withJSONObject: report, options: [.sortedKeys]), as: UTF8.self))
+                        exit(0)
+                    }
+                    if (mode.usesSemantic || deepScanOnly || enhancementComparison) && !LocalGemmaWorker.isAvailable {
+                        fputs("Read-only semantic evaluation requires the existing Gemma model; no installation was started.\n", stderr)
+                        exit(2)
+                    }
+                } catch {
+                    fputs("Read-only evaluation initialization failed: \(error)\n", stderr)
+                    exit(1)
+                }
+            } else {
+                files = LibraryGateway.load(roots: roots)
+            }
             if let error = LibraryGateway.lastError {
                 fputs(error + "\n", stderr)
                 exit(1)
             }
-            if mode.usesSemantic {
+            if enhancementComparison {
+                do {
+                    let rows = try await SearchEnhancementComparison.run(suite: suite, files: files, roots: roots)
+                    print(String(decoding: try JSONSerialization.data(withJSONObject:
+                        ["readOnly": true, "rounds": 3, "cases": rows],
+                        options: [.prettyPrinted, .sortedKeys]), as: UTF8.self))
+                    exit(0)
+                } catch {
+                    fputs("Read-only enhancement comparison failed: \(error)\n", stderr)
+                    exit(1)
+                }
+            }
+            if mode.usesSemantic || deepScanOnly {
                 try? await LocalSemanticIndex.shared.prepareSearch(roots: roots.map(\.path))
+            }
+            if deepScanOnly {
+                do {
+                    var results: [[String: Any]] = []
+                    for test in suite.cases {
+                        let started = ProcessInfo.processInfo.systemUptime
+                        let hits = try await LocalSemanticIndex.shared.searchDeepScan(
+                            query: test.query, roots: roots.map(\.path), topK: 30, readOnly: true)
+                        let milliseconds = (ProcessInfo.processInfo.systemUptime - started) * 1000
+                        results.append([
+                            "id": test.id, "query": test.query, "milliseconds": milliseconds,
+                            "top30": hits.enumerated().map { item -> [String: Any] in
+                                ["rank": item.offset + 1, "fileID": item.element.fileID,
+                                 "path": item.element.path, "score": item.element.score]
+                            },
+                        ])
+                    }
+                    await LocalGemmaWorker.shared.stop()
+                    let report: [String: Any] = ["mode": "deepscan", "readOnly": true,
+                        "caseCount": results.count, "cases": results]
+                    print(String(decoding: try JSONSerialization.data(withJSONObject: report,
+                        options: [.prettyPrinted, .sortedKeys]), as: UTF8.self))
+                    exit(0)
+                } catch {
+                    await LocalGemmaWorker.shared.stop()
+                    fputs("Read-only DeepScan evaluation failed: \(error)\n", stderr)
+                    exit(1)
+                }
             }
             if mode == .local {
                 let report = await SearchEvaluationPipeline.runLocal(
@@ -1121,7 +1359,8 @@ enum SearchEvaluationDiagnostics {
                 for test in suite.cases {
                     let started = ProcessInfo.processInfo.systemUptime
                     let result = await SearchEvaluationPipeline.run(
-                        mode: mode, query: test.query, files: files, roots: roots.map(\.path)
+                        mode: mode, query: test.query, files: files, roots: roots.map(\.path),
+                        resultLimit: readOnly ? 30 : 20
                     )
                     let elapsed = (ProcessInfo.processInfo.systemUptime - started) * 1000
                     results.append((test, result, elapsed))
@@ -1141,7 +1380,10 @@ enum SearchEvaluationDiagnostics {
                 }
             }
             let report = SearchEvaluation.report(
-                suite: suite, mode: mode.rawValue, results: results
+                suite: suite, mode: mode.rawValue, results: results,
+                fileIDsByPath: Dictionary(uniqueKeysWithValues: files.compactMap { file in
+                    file.fileID.map { (file.path, $0) }
+                })
             )
             do {
                 let data = try JSONEncoder.sorted.encode(report)
@@ -1152,7 +1394,12 @@ enum SearchEvaluationDiagnostics {
                 exit(1)
             }
         }
-        RunLoop.current.run()
+        if enhancementComparison {
+            NSApplication.shared.setActivationPolicy(.accessory)
+            NSApplication.shared.run()
+        } else {
+            RunLoop.current.run()
+        }
         return true
     }
 }

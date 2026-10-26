@@ -28,8 +28,10 @@ enum GroqClient {
 
     private static let endpoint = APIConfiguration.chatEndpoint
     private static let imageEndpoint = APIConfiguration.imageEndpoint
-    private static let keyDir = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent("Library/Application Support/AI Everything", isDirectory: true)
+    private static let keyDir = AIEApplicationPaths.isCleanV2
+        ? AIEApplicationPaths.support
+        : FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/AI Everything", isDirectory: true)
     private static var keyFile: URL { keyDir.appendingPathComponent("openrouter.key") }
 
     static var lastError: String?

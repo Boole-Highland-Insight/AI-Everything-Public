@@ -11,6 +11,11 @@ import Vision
 /// 后台按类型写 SQLite 分析记录的 `localScan`：图/视频 Vision，音频 Speech，文本 NaturalLanguage。
 /// 视频帧只在内存里解码，不落盘。增量：已有当前解析器结果且 size/mtime 未变则跳过。
 enum VisionEnricher {
+    static func auditScan(_ file: IndexedFile) -> Bool {
+        guard ArchitectureAuditTrace.enabled,
+              ProcessInfo.processInfo.environment["AIE_DATABASE_PATH"]?.hasPrefix("/tmp/") == true else { return false }
+        return scanOne(root: URL(fileURLWithPath: file.rootPath), file: file)
+    }
     private static let workQueue = DispatchQueue(label: "aie.vision", qos: .utility)
     private static let lock = NSLock()
     private static var running = false
@@ -121,8 +126,8 @@ enum VisionEnricher {
         done: @escaping () -> Void
     ) {
         guard LibraryGateway.lastError == nil else { DispatchQueue.main.async(execute: done); return }
-        let excluded = files.filter { !mediaExts.contains($0.ext) || ScanPolicy.isDeferred($0) }.map {
-            ScanSkipItem(path: $0.relative, reason: ScanPolicy.isDeferred($0) ? "已按用户要求暂缓扫描" : ScanSkipItem.reason(for: $0.ext, cloud: false))
+        let excluded = files.filter { !mediaExts.contains($0.ext) || ScanPolicy.isDeferred($0) || isUserSkipped($0) }.map {
+            ScanSkipItem(path: $0.relative, reason: isUserSkipped($0) ? "已跳过当前版本的内容识别" : (ScanPolicy.isDeferred($0) ? "已按用户要求暂缓扫描" : ScanSkipItem.reason(for: $0.ext, cloud: false)))
         }
         DispatchQueue.main.async { ScanProgress.shared.localSkippedFiles = excluded }
         let fresh = files.filter { needsScan(file: $0) }
@@ -206,7 +211,7 @@ enum VisionEnricher {
             }
             let file = pending.removeFirst()
             lock.unlock()
-            guard LibraryGateway.allowsScanning(file) else {
+            guard LibraryGateway.allowsScanning(file), !isUserSkipped(file) else {
                 lock.lock(); pendingPaths.remove(file.path); lock.unlock()
                 continue
             }
@@ -250,6 +255,12 @@ enum VisionEnricher {
                 }
             } else {
                 durableJob = nil
+            }
+
+            if isUserSkipped(file) {
+                if let durableJob { _ = try? AppDatabase.open().releaseJob(id: durableJob.id, owner: workerID) }
+                lock.lock(); pendingPaths.remove(file.path); lock.unlock()
+                continue
             }
 
             DispatchQueue.main.async {
@@ -329,8 +340,14 @@ enum VisionEnricher {
         }
     }
 
+    private static func isUserSkipped(_ file: IndexedFile) -> Bool {
+        guard let versionID = file.versionID else { return false }
+        do { return try AppDatabase.open().isRecognitionSkipped(path: file.path, versionID: versionID) }
+        catch { AppDatabase.failed(error); return true }
+    }
+
     private static func needsScan(file: IndexedFile) -> Bool {
-        guard mediaExts.contains(file.ext), !ScanPolicy.isDeferred(file) else { return false }
+        guard mediaExts.contains(file.ext), !ScanPolicy.isDeferred(file), !isUserSkipped(file) else { return false }
         guard let obj = ScanRecords.read(file) else { return false }
         if audioExts.contains(file.ext), let transcript = (obj["localScan"] as? [String: Any])?["mediaTranscript"] as? [String: Any],
            transcript["sourceHash"] as? String == file.contentHash, transcript["status"] as? String == "ready" { return false }
@@ -348,7 +365,9 @@ enum VisionEnricher {
                 }
                 if videoExts.contains(file.ext),
                    let samples = local?["videoFrames"] as? [String: Any],
-                   samples["parserVersion"] as? String == VideoSamplePlan.parserVersion { return false }
+                   samples["parserVersion"] as? String == VideoSamplePlan.parserVersion,
+                   samples["error"] == nil,
+                   (samples["frames"] as? [[String: Any]])?.isEmpty == false { return false }
                 if audioExts.contains(file.ext),
                    local?["speech"] != nil {
                     return false
@@ -400,6 +419,8 @@ enum VisionEnricher {
 
     @discardableResult
     private static func scanOne(root: URL, file: IndexedFile) -> Bool {
+        let audit = ArchitectureAuditTrace.begin("local_analysis_file")
+        defer { audit?.end() }
         guard AppDatabase.lastError == nil else { return false }
         let url = URL(fileURLWithPath: file.path)
         guard let attrs = try? FileManager.default.attributesOfItem(atPath: file.path),
@@ -422,6 +443,8 @@ enum VisionEnricher {
             let cachedSamples = existingLocal["videoFrames"] as? [String: Any]
             let samples = existingLocal["sourceHash"] as? String == sourceHash
                 && cachedSamples?["parserVersion"] as? String == VideoSamplePlan.parserVersion
+                && cachedSamples?["error"] == nil
+                && (cachedSamples?["frames"] as? [[String: Any]])?.isEmpty == false
                 ? cachedSamples!
                 : analyzeVideoFrames(url)
             localUpdate["videoFrames"] = samples
@@ -606,6 +629,8 @@ enum VisionEnricher {
     }
 
     private static func runVision(_ image: CGImage) throws -> [String: Any] {
+        let audit = ArchitectureAuditTrace.begin("apple_vision_requests")
+        defer { audit?.end() }
         let ocrReq = VNRecognizeTextRequest()
         ocrReq.recognitionLevel = .accurate
         ocrReq.usesLanguageCorrection = true

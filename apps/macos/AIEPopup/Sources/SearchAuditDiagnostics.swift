@@ -22,13 +22,23 @@ enum SearchAuditDiagnostics {
                     longestTick = max(longestTick, now - previous)
                     previous = now
                 }
+                let routing = SearchRouter.route(args[2])
+                let expected: [String]
+                if routing.uses(.semantic) {
+                    try? await LocalSemanticIndex.shared.prepareSearch(roots: roots.map(\.path))
+                    let semantic = await LocalSemanticIndex.shared.search(
+                        query: args[2], roots: roots.map(\.path))
+                    expected = LibraryGateway.searchCandidates(
+                        query: args[2], in: files, semantic: semantic).map(\.hit.path)
+                } else {
+                    expected = LibraryGateway.search(query: args[2], in: files).map(\.path)
+                }
                 model.query = "过时查询"
                 model.query = args[2]
                 let start = ProcessInfo.processInfo.systemUptime
-                while model.status == "正在搜索…", ProcessInfo.processInfo.systemUptime - start < 10 {
+                while model.fastSearching, ProcessInfo.processInfo.systemUptime - start < 10 {
                     try? await Task.sleep(nanoseconds: 10_000_000)
                 }
-                let expected = LibraryGateway.search(query: args[2], in: files).map(\.path)
                 let matched = model.hits.map(\.path) == expected
                 timer.invalidate()
                 model.query = ""

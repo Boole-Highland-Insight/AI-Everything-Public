@@ -4,6 +4,7 @@ import AIEData
 /// Real embedding integration on explicitly selected, empty synthetic directories only.
 enum SemanticDiagnostics {
     static func runIfRequested() -> Bool {
+        if runDeepScanIfRequested() { return true }
         guard CommandLine.arguments.dropFirst().first == "--verify-semantic" else { return false }
         guard CommandLine.arguments.count == 3, let path = ProcessInfo.processInfo.environment["AIE_DATABASE_PATH"], path.hasPrefix("/") else { exit(2) }
         // Exercise the embedding-only plan without changing saved preferences or downloading models.
@@ -25,19 +26,66 @@ enum SemanticDiagnostics {
                 for (name, text) in samples { try text.write(to: root.appendingPathComponent(name), atomically: true, encoding: .utf8) }
                 let files = LibraryGateway.load(roots: [root])
                 guard LibraryGateway.lastError == nil else { throw CocoaError(.fileReadUnknown) }
-                guard await LocalSemanticIndex.shared.indexNow(roots: [root.path]) else { throw CocoaError(.featureUnsupported) }
+                guard await LocalSemanticIndex.shared.indexNow(roots: [root.path]) else {
+                    throw NSError(domain: "SemanticCheck", code: 2,
+                                  userInfo: [NSLocalizedDescriptionKey: SemanticProgress.shared.text])
+                }
                 let queries = [("刚招来的人第一天该做什么", "onboarding.txt"), ("适合下海玩耍的旅游目的地", "seaside.txt"), ("流程图", "flowchart.txt")]
                 for (query, expected) in queries {
-                    let vectors = await LocalSemanticIndex.shared.search(query: query, roots: [root.path])
-                    guard vectors.first?.path == root.appendingPathComponent(expected).path else { throw NSError(domain: "SemanticCheck", code: 1, userInfo: [NSLocalizedDescriptionKey: "Semantic fixture did not rank the relevant passage first"]) }
+                    let profile = await LocalSemanticIndex.shared.searchProfiled(query: query, roots: [root.path])
+                    let vectors = profile.results
+                    guard vectors.first?.path == root.appendingPathComponent(expected).path,
+                          vectors.first?.kind == "paragraph" else {
+                        throw NSError(domain: "SemanticCheck", code: 1,
+                                  userInfo: [NSLocalizedDescriptionKey: "Raw passage did not rank first: \(profile.error ?? "no search error"); "
+                                             + vectors.prefix(5).map { URL(fileURLWithPath: $0.path).lastPathComponent + ":" + $0.kind }.joined(separator: ",")])
+                    }
                     if query == "流程图", vectors.contains(where: { $0.path == root.appendingPathComponent("headings.txt").path }) { throw CocoaError(.coderInvalidValue) }
                     let hits = LibraryGateway.search(query: query, in: files, semantic: vectors)
                     guard hits.contains(where: { $0.name == expected && $0.chunkID != nil }) else { throw CocoaError(.coderInvalidValue) }
                     print("Semantic fixture passed: \(expected), cosine \(String(format: "%.3f", vectors[0].score))")
                 }
-                print("Real 0.6B-only embedding checks passed; vision and local reranking disabled; no user documents or cloud APIs used.")
+                print("Real \(LocalSemanticIndex.usesGemma ? "Gemma" : "Qwen 0.6B") embedding checks passed; vision and local reranking disabled; no user documents or cloud APIs used.")
                 exit(0)
             } catch { fputs(error.localizedDescription + "\n", stderr); exit(1) }
+        }
+        RunLoop.current.run()
+        return true
+    }
+
+    private static func runDeepScanIfRequested() -> Bool {
+        let args = CommandLine.arguments
+        guard let command = args.dropFirst().first,
+              ["--index-deepscan", "--search-deepscan"].contains(command) else { return false }
+        guard (command == "--index-deepscan" && args.count == 2)
+                || (command == "--search-deepscan" && args.count == 4 && (Int(args[3]) ?? 0) > 0),
+              let path = ProcessInfo.processInfo.environment["AIE_DATABASE_PATH"],
+              path == AppDatabase.url.path, FileManager.default.fileExists(atPath: path) else {
+            fputs("Set AIE_DATABASE_PATH to the existing database; use --index-deepscan or --search-deepscan QUERY TOP_K.\n", stderr)
+            exit(2)
+        }
+        let roots = LibraryRoots.load().map(\.path)
+        guard !roots.isEmpty else { fputs("No authorized roots; database left unchanged.\n", stderr); exit(2) }
+        Task { @MainActor in
+            do {
+                let output: Data
+                var failed = false
+                if command == "--index-deepscan" {
+                    let report = try await LocalSemanticIndex.shared.indexDeepScan(roots: roots)
+                    output = try JSONEncoder().encode(report)
+                    failed = !report.failures.isEmpty
+                } else {
+                    let hits = try await LocalSemanticIndex.shared.searchDeepScan(query: args[2], roots: roots, topK: Int(args[3])!)
+                    output = try JSONEncoder().encode(hits)
+                }
+                await LocalGemmaWorker.shared.stop()
+                print(String(decoding: output, as: UTF8.self))
+                exit(failed ? 1 : 0)
+            } catch {
+                await LocalGemmaWorker.shared.stop()
+                fputs(String(describing: error) + "\n", stderr)
+                exit(1)
+            }
         }
         RunLoop.current.run()
         return true

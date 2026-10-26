@@ -29,24 +29,28 @@ enum EvidencePolicy {
         }}.count
         return Double(matched) / Double(groups.count)
     }
-    static func priority(_ chunk: ChunkResult, cosine: Double, query: LibraryIndex.CompiledQuery) -> Double {
+    static func priority(_ chunk: ChunkResult, cosine: Double, query: LibraryIndex.CompiledQuery,
+                         ranked: Bool = false) -> Double {
         let lexical = coverage((chunk.tags + [chunk.text]).joined(separator: " "), query: query)
-        if chunk.kind == "document" { return 0.5 + max(lexical, cosine) }
+        let semantic = ranked || cosine >= 0.52
+        if chunk.kind == "document" { return 0.5 + max(lexical, ranked ? 0.5 : cosine) }
         if isModelDerived(chunk.kind) {
             let anchor = chunk.startSeconds == nil ? 0.0 : 0.2
             if lexical >= 1 { return 1.5 + cosine + anchor }
-            if cosine >= 0.52 { return 1.25 + cosine + anchor }
+            if semantic { return 1.25 + (ranked ? 0.5 : cosine) + anchor }
             if lexical > 0 { return 1 + lexical + anchor }
             return 0
         }
         // Relevant body always beats a root summary; avoid choosing an arbitrary unrelated body.
         if lexical >= 1 { return 5 + cosine }
-        if cosine >= 0.52 { return 3 + cosine + lexical * 0.2 }
+        if semantic { return 3 + (ranked ? 0.5 : cosine) + lexical * 0.2 }
         if lexical > 0 { return 2 + lexical }
         return 0
     }
-    static func hit(file: IndexedFile, chunk: IndexedChunk, query: String, reason: String) -> FileHit {
-        let root = chunk.kind == "document", needles = LibraryIndex.compile(query).tokens.flatMap(LibraryIndex.aliases)
+    static func hit(file: IndexedFile, chunk: IndexedChunk, query: String, reason: String,
+                    needles preparedNeedles: [String]? = nil) -> FileHit {
+        let root = chunk.kind == "document"
+        let needles = preparedNeedles ?? LibraryIndex.compile(query).tokens.flatMap(LibraryIndex.aliases)
         let source: String, label: String
         if root {
             source = file.fileSummary

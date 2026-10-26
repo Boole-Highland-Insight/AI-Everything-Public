@@ -18,6 +18,11 @@ enum LibraryRoots {
 
     static func runIfRequested() -> Bool {
         let arguments = CommandLine.arguments
+        if arguments.dropFirst().first == "--verify-library-roots" {
+            let paths = load().map(\.path)
+            print(String(decoding: try! JSONSerialization.data(withJSONObject: ["paths": paths, "count": paths.count]), as: UTF8.self))
+            return true
+        }
         guard arguments.dropFirst().first == "--set-library-roots" else { return false }
         let paths = Array(arguments.dropFirst(2))
         guard !paths.isEmpty else {
@@ -30,6 +35,10 @@ enum LibraryRoots {
             return true
         }
         save(urls)
+        guard load().map(\.path) == urls.map(\.path) else {
+            fputs("Folder authorization verification failed; database was not opened.\n", stderr)
+            exit(2)
+        }
         urls.forEach { print($0.path) }
         return true
     }
@@ -105,6 +114,19 @@ enum LibraryRoots {
             ) else { continue }
             _ = url.startAccessingSecurityScopedResource()
             urls.append(url)
+        }
+        // A bookmark resolution failure is not a user request to remove folders.
+        // Refuse startup before SearchModel can send an incomplete scope to restrictRoots.
+        guard urls.count == datas.count else {
+            fputs("Saved folder authorization could not be restored; index left unchanged.\n", stderr)
+            if !CommandLine.arguments.dropFirst().contains(where: { $0.hasPrefix("--") }) {
+                _ = NSApplication.shared
+                let alert = NSAlert()
+                alert.messageText = "资料夹授权未能恢复"
+                alert.informativeText = "为保护已有索引，本次不会启动扫描或清理数据库。请使用版本迁移启动器重新恢复资料夹授权。"
+                alert.runModal()
+            }
+            exit(2)
         }
         if stale { save(urls) }
         return urls

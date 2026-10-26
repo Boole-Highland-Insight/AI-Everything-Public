@@ -9,7 +9,7 @@ enum AppLog {
         lock.lock()
         defer { lock.unlock() }
         let directory = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Logs/AI Everything", isDirectory: true)
+            .appendingPathComponent(AIEApplicationPaths.isCleanBaseline ? "Library/Logs/AIE Clean Baseline" : "Library/Logs/AI Everything", isDirectory: true)
         do {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
                                                    attributes: [.posixPermissions: 0o700])

@@ -43,14 +43,27 @@ if [ -n "${AIE_BUILD_NUMBER:-}" ]; then
   /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $AIE_BUILD_NUMBER" "$APP/Contents/Info.plist"
 fi
 cp "$ROOT/Resources/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
-cp "$ROOT/Resources/DigUp-LICENSE.txt" "$APP/Contents/Resources/"
+GEMMA_MODELS_SOURCE="${AIE_GEMMA_MODELS_SOURCE:-$HOME/Library/Application Support/AI Everything/Semantic/models}"
+bash "$PROJECT/tools/fetch_gemma_models.sh" "$GEMMA_MODELS_SOURCE"
+mkdir -p "$APP/Contents/Resources/GemmaModels"
+cp "$GEMMA_MODELS_SOURCE/embeddinggemma-2-Q8_0.gguf" "$APP/Contents/Resources/GemmaModels/"
+cp "$GEMMA_MODELS_SOURCE/mmproj-embeddinggemma-2-Q8_0.gguf" "$APP/Contents/Resources/GemmaModels/"
+cp "$ROOT/Resources/EmbeddingGemma2-SOURCE.txt" "$APP/Contents/Resources/GemmaModels/"
+cp "$ROOT/Resources/EmbeddingGemma2-APACHE-2.0.txt" "$APP/Contents/Resources/GemmaModels/"
+bash "$PROJECT/tools/build_gemma_runtime.sh" "$APP/Contents/Resources/GemmaRuntime"
 cp "$ROOT/Resources/OnboardingDemo-"*.mp4 "$ROOT/Resources/OnboardingDemo-"*.png "$APP/Contents/Resources/"
 cp "$PROJECT/tools/setup_local_quickscan.sh" "$APP/Contents/Resources/"
 cp "$PROJECT/tools/setup_local_semantic.sh" "$APP/Contents/Resources/"
 cp "$PROJECT/tools/pull_local_model.py" "$APP/Contents/Resources/"
 if [ -n "${AIE_SIGN_IDENTITY:-}" ]; then
+  while IFS= read -r -d '' FILE; do
+    codesign --force --options runtime --timestamp --sign "$AIE_SIGN_IDENTITY" "$FILE"
+  done < <(find "$APP/Contents/Resources/GemmaRuntime" -type f \( -name '*.dylib' -o -name 'llama-server' \) -print0)
   codesign --force --options runtime --timestamp --sign "$AIE_SIGN_IDENTITY" "$APP"
 else
+  while IFS= read -r -d '' FILE; do
+    codesign --force --sign - "$FILE" >/dev/null
+  done < <(find "$APP/Contents/Resources/GemmaRuntime" -type f \( -name '*.dylib' -o -name 'llama-server' \) -print0)
   codesign --force --sign - "$APP" >/dev/null
 fi
 codesign --verify --deep --strict "$APP"

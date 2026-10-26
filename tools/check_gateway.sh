@@ -44,9 +44,7 @@ with tempfile.TemporaryDirectory(prefix='aie-gateway-') as temporary:
     frame_ocr=run('站台')['hits'][0]
     assert frame_ocr['name']=='clip.mp4' and frame_ocr['tier']=='direct' and '00:12–00:13' in frame_ocr['snippet'],frame_ocr
     assert frame_ocr['startSeconds']==12 and frame_ocr['endSeconds']==13, frame_ocr
-    frame_model=run('黄色汽车')['hits'][0]
-    assert frame_model['name']=='clip.mp4' and frame_model['tier']=='possible' and '00:12–00:13' in frame_model['snippet'],frame_model
-    assert frame_model['startSeconds']==12 and frame_model['endSeconds']==13, frame_model
+    assert not run('黄色汽车')['hits'], 'Model video descriptions must stay outside V1 FTS'
     ppt_hit=next(h for h in report['hits'] if h['name']=='sample.pptx')
     assert ppt_hit['page']==3 and ppt_hit['chunkID'] and '第 3 页' in ppt_hit['snippet'],report
     assert ppt_hit['tier']=='direct' and 'body' in ppt_hit['evidenceSources'],ppt_hit

@@ -6,15 +6,19 @@ enum IndexDiagnostics {
     static func runIfRequested() -> Bool {
         let args = CommandLine.arguments
         let fallback = args.dropFirst().first == "--verify-fallback"
-        guard args.dropFirst().first == "--verify-index" || fallback else { return false }
+        let catalog = args.dropFirst().first == "--verify-catalog"
+        let catalogFallback = args.dropFirst().first == "--verify-catalog-fallback"
+        guard args.dropFirst().first == "--verify-index" || fallback || catalog || catalogFallback else { return false }
         guard args.count == 4, let databasePath = ProcessInfo.processInfo.environment["AIE_DATABASE_PATH"],
               !databasePath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             fputs("usage: AIE_DATABASE_PATH=/temporary/index.sqlite AIEPopup --verify-index /library query\n", stderr)
             exit(2)
         }
-        let files = LibraryGateway.load(roots: [URL(fileURLWithPath: args[2])])
+        let files = catalog || catalogFallback
+            ? LibraryIndex.load(roots: [URL(fileURLWithPath: args[2])])
+            : LibraryGateway.load(roots: [URL(fileURLWithPath: args[2])])
         if let error = LibraryGateway.lastError { fputs(error + "\n", stderr); exit(1) }
-        let hits = fallback
+        let hits = fallback || catalogFallback
             ? LibraryGateway.fallbackCandidates(query: args[3], in: files, semantic: [])
             : LibraryGateway.search(query: args[3], in: files)
         if let error = LibraryGateway.lastError { fputs(error + "\n", stderr); exit(1) }

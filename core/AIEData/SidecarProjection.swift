@@ -149,10 +149,16 @@ public enum SidecarProjection {
                 for frame in frames {
                     guard let index = frame["index"] as? Int,
                           let start = (frame["startSeconds"] as? NSNumber)?.doubleValue,
-                          let end = (frame["endSeconds"] as? NSNumber)?.doubleValue,
-                          let vision = frame["vision"] as? [String: Any]
+                          let end = (frame["endSeconds"] as? NSNumber)?.doubleValue
                     else { continue }
-                    appendVision(vision, keyPrefix: "vision-frame-\(index)", startSeconds: start, endSeconds: end)
+                    source.blocks.append(ContentBlock(
+                        key: "visual-frame-\(index)", kind: "visual_frame", startSeconds: start,
+                        endSeconds: end, text: "", summaryMethod: "visual_anchor",
+                        parserVersion: videoFrames["parserVersion"] as? String ?? "video-sample-1"
+                    ))
+                    if let vision = frame["vision"] as? [String: Any] {
+                        appendVision(vision, keyPrefix: "vision-frame-\(index)", startSeconds: start, endSeconds: end)
+                    }
                 }
                 source.coverage = frames.isEmpty ? "partial" : "sampled_video"
             } else if let vision = local["vision"] as? [String: Any] {

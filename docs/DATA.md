@@ -35,7 +35,7 @@ flowchart BT
 | 3 | 原生内容提取 | PPT/PDF/DOCX/XLSX/TXT/Archive/MSG/XML 解析器 | 文件当前版本 | 页、段落、sheet、转写片段等可定位证据 | `chunks`、`content_units`、`unit_contents` | 可以搜到 PPT 页、PDF 页、正文、表格、邮件正文 |
 | 4 | 本机 OCR / 系统视觉 | Apple Vision、macOS 本机分析 | 图片、扫描 PDF、截图、抽帧 | OCR 文字、基础标签、截图/空白/线稿等轻量判断 | `analysis_records`、`analysis_fields`、`unit_contents`、`search_documents` | 图片和扫描件开始能被文字搜到 |
 | 5 | 搜索投影 | SearchEncoding、SQLite FTS5 | 文件名、路径、标题、正文、OCR、摘要、关键词 | 多字段 FTS 文档、数字片段、可重建搜索缓存 | `search_documents`、`search_documents_fts` | 输入关键词时快速返回结果和命中片段 |
-| 6 | 语义向量 | Qwen3 Embedding 0.6B、本机 Ollama | 已提取的内容单元文本、OCR、标签、短摘要 | 1,024 维文本 embedding | `features(feature_type='text_embedding')`；版本化、归一化 Float16 BLOB | 自然语言模糊搜索更容易召回相关内容 |
+| 6 | 语义向量 | EmbeddingGemma 2、随 App 附带的 llama.cpp 运行时 | 已提取的内容单元文本、OCR、标签、短摘要，以及图片 / 页面 | 文本与视觉 embedding | `features(feature_type='text_embedding')`；版本化、归一化 Float16 BLOB | 自然语言模糊搜索更容易召回相关内容 |
 | 7 | 深度理解 | Qwen3-VL 8B | 少量需要理解的内容单元、OCR、低分辨率视觉材料 | 视觉描述、页面摘要、主题、实体、重要数字、搜索短语 | 权威原始记录 `analysis_records`；结构化投影 `observations`、`model_runs`、`jobs` | 搜索解释更准，回收/未完成/咔哒有更好的判断依据 |
 | 8 | 精搜重排 | Qwen3-VL 8B、LocalRerank | FTS/向量已经召回的 Top 候选 | 候选编号排序、是否相关的判断 | 不直接改权威内容；可记录到 `model_runs` | 用户点「精搜」后，模糊结果被重新筛选和排序 |
 | 9 | 关系与清理 | hash、未来 pHash/dHash、Apple Vision Feature Print、规则分类器 | 文件版本、图片特征、内容观察 | 完全重复、近重复、来源-产物、低价值/未完成关系 | `relations`、`features`、`trash_records` | 回收页、重复文件、咔哒产物关联更准确 |
@@ -67,7 +67,7 @@ flowchart BT
 | `content_units` / `unit_contents` | 面向搜索和展示的可定位证据单元及其原生文字、OCR、转写或表格内容 |
 | `search_documents` / `search_documents_fts` | 从内容单元派生的多字段搜索投影，按文件名、路径、标题、正文、OCR、图表、转写、摘要、关键词和实体分别索引 |
 | `observations` | Apple Vision 分类/画布判断及 Qwen3-VL 摘要、主题、实体、证据、对象、动作、可见文字、完成状态 |
-| `features` | 当前内容 SHA-256 与 0.6B 文本 embedding 的统一权威特征表；向量记录模型、模型版本、维度、度量、格式与内容 hash；近重复图像特征仍待接入 |
+| `features` | 当前内容 SHA-256 与 Gemma embedding 的统一权威特征表；向量记录模型、模型版本、维度、度量、格式与内容 hash；近重复图像特征仍待接入 |
 | `relations` | 当前完全重复关系和咔哒 `generated_from` 来源关系；近重复关系仍待接入 |
 | `jobs` / `model_runs` | 按内容版本持久化阶段状态、claim/lease/retry/checkpoint，以及本机/云端处理器、模型 digest、输入指纹和结果 |
 
@@ -93,7 +93,7 @@ AI Everything 的本机能力按速度和职责分层写入数据库。首次扫
 | 本机结构解析器 | 提取 PPT/PDF/DOCX/TXT/XLSX/压缩包等原生文字，按页、段落、sheet 或时间段生成可定位证据 | `chunks`、`content_units`、`unit_contents`、`semantic_records`、`search_documents` |
 | Apple Vision / macOS 本机分析 | OCR 写事实内容；分类、人数、条码和画布判断写 observation；后续 OCR 坐标应拆入专门表 | `analysis_records`、`analysis_fields`、`unit_contents`、`observations`、`search_documents` |
 | 本机音频转写 | 将音频或视频音轨拆成带开始/结束时间的转写块 | `chunks`、`content_units`、`unit_contents`、`scan_jobs` |
-| Qwen3 Embedding 0.6B | 为已经提取好的内容单元生成文本语义向量，用于自然语言召回；不读取原文件，不生成摘要 | `features(feature_type='text_embedding')` |
+| EmbeddingGemma 2 | 为已经提取好的内容单元及图片 / 页面生成语义向量，用于自然语言召回；不生成摘要 | `features(feature_type='text_embedding')` |
 | Qwen3-VL 8B | 后台理解少量需要视觉/语义判断的内容单元，生成页面描述、摘要、主题、实体、重要数字和搜索短语；也用于精搜候选重排 | 原始结构保留在分析记录；字段投影到 `observations`，运行来源写入 `model_runs`，阶段写入 `jobs` |
 | FTS5 / SearchEncoding | 从内容单元派生多字段搜索投影和数字片段索引 | `search_documents`、`search_documents_fts` |
 
@@ -101,7 +101,7 @@ AI Everything 的本机能力按速度和职责分层写入数据库。首次扫
 
 语义向量采用全局 1.6 GB 软预算，并按内容类别公平调度：照片 20%、PPT/PDF 等分页文档 30%、普通文档 25%、音视频 20%、其他 5%。这是可借用的调度份额，不是硬分区。正文 chunk、OCR、转写和 FTS 不受该预算裁剪；空间不足时只停止继续生成向量。
 
-0.6B 与 8B 的职责不同：0.6B 只产出向量，帮助“召回可能相关的内容”；8B 产出观察和判断，帮助“理解候选为什么相关”。两者都不修改原文件，写入前都绑定具体内容版本和内容 hash。文件更新后，旧块、旧 observation、旧向量不会代表新版本。
+Gemma 与 8B 的职责不同：Gemma 只产出向量，帮助“召回可能相关的内容”；8B 产出观察和判断，帮助“理解候选为什么相关”。两者都不修改原文件，写入前都绑定具体内容版本和内容 hash。文件更新后，旧块、旧 observation、旧向量不会代表新版本。
 
 在新的表结构里，8B 不写 `unit_contents`。`unit_contents` 保存原生文字、OCR、转写、表格文字等可验证内容；8B 的结构化输出写入 `observations`，例如 `summary.short`、`topic`、`entity`、`visual.scene`、`document.completeness`。适合搜索的短摘要、实体和关键词再派生到 `search_documents`，后者可以删除重建。音频转写使用独立 `transcript_text` 搜索字段，不再依赖前 180 字摘要才能命中。
 
@@ -166,7 +166,7 @@ XLSX 当前最多读取 100 张工作表、50,000 个非空行、4,000,000 字�
 - `searchVector(_:spaceID:rootPaths:limit:)`：指定模型空间中的精确余弦查询，适合初期本机规模；尚未使用 ANN 向量索引。
 - `linkArtifact(sourceVersionID:artifactFileID:relation:rootPaths:)`：关联生成产物与授权范围内的源文件版本。
 
-应用已接入 Qwen3 Embedding 本机语义召回，通过 RRF 与全文及规则结果融合。模型输入、安装及边界见 [项目介绍](../README.md)。后续逐块语义分析应写入独立记录，不得用摘要覆盖原文块。MCP 适配层可复用只读查询和证据接口，但应另行实现调用方授权与能力限制。API Key 的现有配置见 [隐私说明](PRIVACY.md)。
+应用已接入 EmbeddingGemma 2 本机语义召回，通过 RRF 与全文及规则结果融合。后续逐块语义分析应写入独立记录，不得用摘要覆盖原文块。MCP 适配层可复用只读查询和证据接口，但应另行实现调用方授权与能力限制。API Key 的现有配置见[隐私说明](PRIVACY.md)。
 
 ## 存储、恢复与隐私
 

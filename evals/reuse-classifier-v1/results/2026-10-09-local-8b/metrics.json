@@ -1,0 +1,157 @@
+{
+  "instances": 100,
+  "accuracy": 0.83,
+  "correct": 83,
+  "errors": 17,
+  "perClass": {
+    "completion": {
+      "support": 25,
+      "precision": 1.0,
+      "recall": 0.64,
+      "misses": 9,
+      "falsePositives": 0
+    },
+    "optimization": {
+      "support": 20,
+      "precision": 0.5652,
+      "recall": 0.65,
+      "misses": 7,
+      "falsePositives": 10
+    },
+    "none": {
+      "support": 45,
+      "precision": 0.8627,
+      "recall": 0.9778,
+      "misses": 1,
+      "falsePositives": 7
+    },
+    "duplicate": {
+      "support": 10,
+      "precision": 1.0,
+      "recall": 1.0,
+      "misses": 0,
+      "falsePositives": 0
+    }
+  },
+  "confusion": {
+    "completion": {
+      "completion": 16,
+      "optimization": 9
+    },
+    "optimization": {
+      "optimization": 13,
+      "none": 7
+    },
+    "none": {
+      "none": 44,
+      "optimization": 1
+    },
+    "duplicate": {
+      "duplicate": 10
+    }
+  },
+  "errorItems": [
+    {
+      "id": "txt-completion-005",
+      "actual": "completion",
+      "predicted": "optimization",
+      "path": "instances/text/访谈纪要.md"
+    },
+    {
+      "id": "txt-completion-006",
+      "actual": "completion",
+      "predicted": "optimization",
+      "path": "instances/text/会议记录.txt"
+    },
+    {
+      "id": "txt-completion-007",
+      "actual": "completion",
+      "predicted": "optimization",
+      "path": "instances/text/研究笔记.md"
+    },
+    {
+      "id": "txt-completion-008",
+      "actual": "completion",
+      "predicted": "optimization",
+      "path": "instances/text/用户故事.txt"
+    },
+    {
+      "id": "txt-optimization-004",
+      "actual": "optimization",
+      "predicted": "none",
+      "path": "instances/text/活动回顾.md"
+    },
+    {
+      "id": "txt-optimization-005",
+      "actual": "optimization",
+      "predicted": "none",
+      "path": "instances/text/产品简介.txt"
+    },
+    {
+      "id": "txt-none-010",
+      "actual": "none",
+      "predicted": "optimization",
+      "path": "instances/text/操作手册.txt"
+    },
+    {
+      "id": "img-optimization-002",
+      "actual": "optimization",
+      "predicted": "none",
+      "path": "instances/image/待优化_产品卡片.png"
+    },
+    {
+      "id": "img-optimization-004",
+      "actual": "optimization",
+      "predicted": "none",
+      "path": "instances/image/春季活动.png"
+    },
+    {
+      "id": "img-optimization-005",
+      "actual": "optimization",
+      "predicted": "none",
+      "path": "instances/image/课程宣传.png"
+    },
+    {
+      "id": "pdf-completion-003",
+      "actual": "completion",
+      "predicted": "optimization",
+      "path": "instances/pdf/复盘记录_3.pdf"
+    },
+    {
+      "id": "pdf-completion-004",
+      "actual": "completion",
+      "predicted": "optimization",
+      "path": "instances/pdf/复盘记录_4.pdf"
+    },
+    {
+      "id": "pdf-completion-005",
+      "actual": "completion",
+      "predicted": "optimization",
+      "path": "instances/pdf/复盘记录_5.pdf"
+    },
+    {
+      "id": "pdf-optimization-003",
+      "actual": "optimization",
+      "predicted": "none",
+      "path": "instances/pdf/市场分析_3.pdf"
+    },
+    {
+      "id": "pdf-optimization-004",
+      "actual": "optimization",
+      "predicted": "none",
+      "path": "instances/pdf/市场分析_4.pdf"
+    },
+    {
+      "id": "ppt-completion-004",
+      "actual": "completion",
+      "predicted": "optimization",
+      "path": "instances/pptx/季度计划_4.pptx"
+    },
+    {
+      "id": "ppt-completion-005",
+      "actual": "completion",
+      "predicted": "optimization",
+      "path": "instances/pptx/季度计划_5.pptx"
+    }
+  ]
+}

@@ -4,6 +4,15 @@ import Foundation
     static func main() {
         precondition(GroqRerank.parseIds(#"{"ids":[true,1.5,-1,0,1,10000,"1"]}"#, limit: 2) == [0,1])
         precondition(GroqRerank.parseIds(#"{"ids":[1e300]}"#, limit: 20).isEmpty)
+        precondition(Set(JevRerank.questions().keys) == ["relevance", "evidence", "material"],
+                     "Jev must ask all three product judgments")
+        let rejected = JevRerank.parseJudgment([
+            "relevance": ["noul": 0],
+            "evidence": ["score": 2],
+            "material": ["choice": "supporting_context"],
+        ])
+        precondition(rejected.map(JevRerank.isSeriouslyIrrelevant) == true,
+                     "Jev direct relevance rejection must remove a possible candidate")
         var filename = FileHit(path: "/fixture/exact.pptx", name: "exact.pptx", relative: "exact.pptx", kind: .document, ext: "pptx",
             mtime: .distantPast, reason: "文件名", score: 30, snippet: "第 3 页 · 审批", highlights: [], thumbPath: nil,
             uploadedToCloud: false, chunkID: "page-3", page: 3)
@@ -13,6 +22,15 @@ import Foundation
         filename.confidenceTier = .direct
         filename.evidence = [.init(source: .filename, strength: 1, chunkID: nil, page: nil)]
         content.confidenceTier = .possible
+        let semanticOnly = FileHit(path: "/fixture/semantic.pdf", name: "semantic.pdf", relative: "semantic.pdf",
+            kind: .document, ext: "pdf", mtime: .distantPast, reason: "语义", score: 20,
+            snippet: "第 63 页 · 记忆模块", highlights: [], thumbPath: nil, uploadedToCloud: false,
+            chunkID: "page-63", page: 63)
+        let combined = SearchResultMerge.merge(lexical: [filename, content], semantic: [content, semanticOnly])
+        precondition(combined.map(\.path) == [content.path, semanticOnly.path, filename.path],
+                     "Semantic result was lost when lexical retrieval completed last")
+        precondition(SearchResultMerge.merge(lexical: [], semantic: [content, semanticOnly]) == [content, semanticOnly],
+                     "Semantic-only results were lost")
         let merged = GroqRerank.merge(ranked: ["/outside/secret", content.path, content.path], local: [filename,content], files: [], query: "审批")
         precondition(merged == [filename, content], "Reranker replaced evidence, displaced filename or introduced an un-retrieved file")
         precondition(GroqRerank.merge(ranked: [], local: [filename,content], files: [], query: "审批") == [filename,content])
@@ -31,6 +49,10 @@ import Foundation
                      && Set(routedReport.routes) == [.lexical, .semantic, .modelPlan])
         precondition(SearchRouter.route("844209").kind == .identifier)
         precondition(SearchRouter.route("report_final_v3.pdf").kind == .locator)
+        precondition(SearchRouter.route("体温 39.2 度的截图").uses(.semantic))
+        precondition(LibraryIndex.compile("汽油量 6.7 加仑").ext == nil)
+        precondition(SearchRouter.route("LLM 模型名 .env.local").uses(.semantic))
+        precondition(LibraryIndex.compile("LLM 模型名 .env.local").ext == nil)
         precondition(SearchRouter.route("所有图片").kind == .browse)
         precondition(!SearchRouter.route("844209").uses(.semantic)
                      && !SearchRouter.route("report_final_v3.pdf").uses(.modelPlan),

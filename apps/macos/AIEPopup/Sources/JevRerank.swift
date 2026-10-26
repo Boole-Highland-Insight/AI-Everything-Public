@@ -56,9 +56,10 @@ enum JevRerank {
         return value
     }
 
-    /// `AIE_JEV_PROMPT=3` restores the earlier relevance question. The app default is two questions.
+    /// The product uses all three judgments. Setting `AIE_JEV_PROMPT=2` is retained only
+    /// for controlled comparisons with the earlier two-question prompt.
     private static var promptUsesRelevance: Bool {
-        ProcessInfo.processInfo.environment["AIE_JEV_PROMPT"] == "3"
+        ProcessInfo.processInfo.environment["AIE_JEV_PROMPT"] != "2"
     }
 
     struct Outcome {
@@ -75,6 +76,7 @@ enum JevRerank {
         let evidence: Double
         let confidence: Double
         let material: String
+        let relevance: Double?
         let rankScore: Double
     }
 
@@ -169,9 +171,10 @@ enum JevRerank {
         }.map(\.element)
     }
 
-    /// The material is irrelevant and the evidence level is below 轻微相关.
+    /// A direct relevance rejection is decisive; legacy two-question judgments use material/evidence.
     static func isSeriouslyIrrelevant(_ judgment: Judgment) -> Bool {
-        judgment.material == "irrelevant" && judgment.evidence < 1
+        if let relevance = judgment.relevance, relevance < 0.5 { return true }
+        return judgment.material == "irrelevant" && judgment.evidence < 1
     }
 
     static func rankScore(evidence: Double, material: String) -> Double {
@@ -331,6 +334,7 @@ enum JevRerank {
             evidence: evidence,
             confidence: confidence,
             material: material,
+            relevance: relevance,
             rankScore: scoredRank(evidence: evidence, material: material, relevance: relevance)
         )
     }

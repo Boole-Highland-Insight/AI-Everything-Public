@@ -16,6 +16,15 @@ struct SemanticSearchProfile {
     let error: String?
 }
 
+struct DeepScanIndexReport: Codable {
+    let space: String
+    let total: Int
+    let generated: Int
+    let reused: Int
+    let skipped: Int
+    let failures: [String]
+}
+
 @MainActor final class SemanticProgress: ObservableObject {
     enum Phase { case checking, running, paused, complete, unavailable, disabled }
     static let shared = SemanticProgress()
@@ -31,39 +40,42 @@ struct SemanticSearchProfile {
 /// A loopback-only embedding client. A missing runtime/model never blocks lexical search.
 actor LocalSemanticIndex {
     static let shared = LocalSemanticIndex()
-    static let model = LocalScanPlan.embeddingModel
-    static let endpoint = URL(string: "http://127.0.0.1:11435")!
-    /// Ollama unloads idle models, and reloading cost ~1.4s on the first keystroke after a pause.
-    /// The search model stays resident instead, holding 1.7-2.4 GB depending on KV cache use.
-    private static let keepAlive = -1
-    private var process: Process?
+    static let usesGemma = true
     private var roots: [String] = []
     private var job: Task<Void, Never>?
     private var generation = 0
     private var digest: String?
     private var queryCache: [String: [Float]] = [:]
     private var retryAfter = Date.distantPast
-    private let session: URLSession = {
-        let config = URLSessionConfiguration.ephemeral
-        config.timeoutIntervalForRequest = 90
-        config.timeoutIntervalForResource = 120
-        config.connectionProxyDictionary = [:]
-        return URLSession(configuration: config, delegate: NoRedirect(), delegateQueue: nil)
-    }()
-    private final class NoRedirect: NSObject, URLSessionTaskDelegate {
-        func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
-                        newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) { completionHandler(nil) }
-    }
-    private var space: String? { digest.map { "ollama:qwen3-embedding:0.6b:" + $0 + ":evidence-v1" } }
-    private static var directory: URL {
-        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("AI Everything/Semantic")
-    }
+    private static let indexedSemanticMethods = [
+        "file_summary",
+        "local_multimodal_deep_scan",
+        "local_multimodal_video_segment",
+    ]
+    private var space: String? { digest.map {
+        "gemma2:" + $0 + ":understanding-v1"
+    } }
+    private var rawSpace: String? { digest.map {
+        "gemma2:" + $0 + ":raw-text-v1"
+    } }
+    private var visualSpace: String? { digest.map { "gemma2:" + $0 + ":visual-page-v1" } }
     func indexNow(roots requested: [String]) async -> Bool {
         update(roots: requested)
         let active = job
         await active?.value
-        guard let space, let coverage = try? AppDatabase.open().embeddingCoverage(spaceID: space, rootPaths: requested) else { return false }
-        return coverage.total > 0 && coverage.ready == coverage.total
+        guard let space, let rawSpace, let db = try? AppDatabase.open(),
+              let raw = try? db.embeddingCoverage(
+                spaceID: rawSpace, rootPaths: requested, rawTextOnly: true,
+                includeAllTextKinds: Self.usesGemma)
+        else { return false }
+        let summary: (ready: Int, total: Int) = Self.usesGemma ? (0, 0) : ((try? db.embeddingCoverage(
+            spaceID: space, rootPaths: requested, semanticMethods: Self.indexedSemanticMethods)) ?? (0, 0))
+        let visual = Self.usesGemma && visualSpace != nil
+            ? try? db.visualEmbeddingCoverage(spaceID: visualSpace!, rootPaths: requested) : nil
+        if Self.usesGemma && visual == nil { return false }
+        return summary.total + raw.total + (visual?.total ?? 0) > 0
+            && summary.ready == summary.total && raw.ready == raw.total
+            && (visual == nil || visual!.ready == visual!.total)
     }
     func update(roots requested: [String], force: Bool = false) {
         let requested = requested.sorted()
@@ -80,7 +92,7 @@ actor LocalSemanticIndex {
     }
 
     func interruptForInteractiveWork() {
-        session.getAllTasks { tasks in tasks.forEach { $0.cancel() } }
+        Task { await LocalGemmaWorker.shared.interruptBackground() }
     }
     func stopAndUnload() async {
         generation += 1
@@ -99,68 +111,17 @@ actor LocalSemanticIndex {
     /// Drops the resident embedding weights. The next search loads them again.
     /// Search planning must call this first: the vector model is otherwise pinned, and the 8B loads beside it.
     func unload() async {
-        _ = try? await request("api/generate", body: ["model": Self.model, "keep_alive": 0])
+        await LocalGemmaWorker.shared.stop()
     }
 
-    private func request(_ route: String, body: [String: Any]? = nil) async throws -> [String: Any] {
-        var request = URLRequest(url: Self.endpoint.appendingPathComponent(route))
-        if let body {
-            request.httpMethod = "POST"; request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            request.httpBody = try JSONSerialization.data(withJSONObject: body)
-        } else { request.timeoutInterval = 2 }
-        let (data, response) = try await session.data(for: request)
-        guard let response = response as? HTTPURLResponse, response.statusCode == 200,
-              let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { throw CocoaError(.coderInvalidValue) }
-        return object
-    }
     private func ensureModel() async throws {
-        if digest != nil { return }
-        do { try await readModel() }
-        catch {
-            let executable = Self.directory.appendingPathComponent("bin/ollama")
-            guard FileManager.default.isExecutableFile(atPath: executable.path) else { throw SemanticError.notInstalled }
-            if process?.isRunning != true {
-                let child = Process(); child.executableURL = executable; child.arguments = ["serve"]
-                var environment = ProcessInfo.processInfo.environment
-                environment["OLLAMA_HOST"] = "127.0.0.1:11435"
-                environment["OLLAMA_MODELS"] = Self.directory.appendingPathComponent("models").path
-                environment["OLLAMA_NO_CLOUD"] = "1"
-                environment["OLLAMA_NUM_PARALLEL"] = "1"
-                child.environment = environment
-                child.standardOutput = FileHandle.nullDevice; child.standardError = FileHandle.nullDevice
-                try OwnedModelProcesses.run(child); process = child
-            }
-            for _ in 0..<15 {
-                try Task.checkCancellation()
-                try await Task.sleep(nanoseconds: 200_000_000)
-                if (try? await readModel()) != nil { return }
-            }
-            throw SemanticError.notInstalled
-        }
+        if !LocalGemmaWorker.isAvailable { try await LocalGemmaInstaller.install() }
+        let version = try await LocalGemmaWorker.shared.revision()
+        if digest != version { digest = version; queryCache.removeAll() }
     }
-    private func readModel() async throws {
-        let object = try await request("api/tags")
-        guard let models = object["models"] as? [[String: Any]],
-              let model = models.first(where: { $0["name"] as? String == Self.model }),
-              let version = model["digest"] as? String, !version.isEmpty else { throw SemanticError.notInstalled }
-        if digest != version {
-            digest = version
-            queryCache.removeAll()
-        }
-    }
-    private func embed(_ texts: [String]) async throws -> [[Float]] {
-        let expected = digest
-        try await readModel()
-        guard digest == expected else { queryCache.removeAll(); throw SemanticError.badResponse }
-        let object = try await request("api/embed", body: ["model": Self.model, "input": texts, "truncate": false,
-            // Smaller evaluation batches reduce scratch memory without truncating inputs.
-            "keep_alive": Self.keepAlive, "options": ["num_ctx": 8192, "num_batch": 128]])
-        guard let vectors = object["embeddings"] as? [[NSNumber]], vectors.count == texts.count else { throw SemanticError.badResponse }
-        try await readModel()
-        guard digest == expected else { queryCache.removeAll(); throw SemanticError.badResponse }
-        let result = vectors.map { $0.map(\.floatValue) }
-        guard result.allSatisfy({ $0.count == 1024 && $0.allSatisfy(\.isFinite) && $0.contains(where: { $0 != 0 }) }) else { throw SemanticError.badResponse }
-        return result
+
+    private func embed(_ texts: [String], background: Bool = false) async throws -> [[Float]] {
+        try await LocalGemmaWorker.shared.text(texts, background: background)
     }
     private func build(generation current: Int) async {
         defer { if current == generation { job = nil } }
@@ -173,12 +134,40 @@ actor LocalSemanticIndex {
                 progress.phase = .checking
             }
             try await ensureModel()
-            guard current == generation, !Task.isCancelled, let space else { return }
+            guard current == generation, !Task.isCancelled, let space, let rawSpace else { return }
             let db = try AppDatabase.open()
             let timingKey = ScanTiming.key(stage: "semantic", model: space)
+            var preferRaw = true
+            var preferVisual = true
             while current == generation && !Task.isCancelled && ScanConfiguration.semanticEnabled() {
+                if ScanControl.shared.isInteractiveWorkActive || ScanControl.shared.isHeavyModelActive {
+                    await MainActor.run {
+                        SemanticProgress.shared.phase = .paused
+                        SemanticProgress.shared.text = "优先响应搜索 · 稍后自动继续"
+                    }
+                    try await Task.sleep(nanoseconds: 200_000_000)
+                    continue
+                }
                 let snapshot = roots
-                let coverage = try db.embeddingCoverage(spaceID: space, rootPaths: snapshot)
+                // Large-library bookkeeping must not occupy the actor that handles queries.
+                let visualSpace = self.visualSpace
+                let coverage = try await Task.detached(priority: .utility) {
+                    let summary = Self.usesGemma ? (ready: 0, total: 0) : try db.embeddingCoverage(
+                        spaceID: space, rootPaths: snapshot,
+                        semanticMethods: Self.indexedSemanticMethods
+                    )
+                    let raw = try db.embeddingCoverage(
+                        spaceID: rawSpace, rootPaths: snapshot, rawTextOnly: true,
+                        includeAllTextKinds: Self.usesGemma
+                    )
+                    let visual = try visualSpace.map { try db.visualEmbeddingCoverage(spaceID: $0, rootPaths: snapshot) }
+                    return (ready: summary.ready + raw.ready + (visual?.ready ?? 0),
+                            total: summary.total + raw.total + (visual?.total ?? 0),
+                            summaryPending: summary.ready < summary.total,
+                            rawPending: raw.ready < raw.total,
+                            visualPending: (visual?.ready ?? 0) < (visual?.total ?? 0))
+                }.value
+                guard current == generation, !Task.isCancelled else { return }
                 await MainActor.run {
                     let progress = SemanticProgress.shared
                     progress.ready = coverage.ready
@@ -206,7 +195,11 @@ actor LocalSemanticIndex {
                     try await Task.sleep(nanoseconds: 2_000_000_000)
                     continue
                 }
-                let capacity = try db.indexCapacity(spaceID: space)
+                let capacity = try await Task.detached(priority: .utility) {
+                    try db.indexCapacity()
+                }.value
+                guard current == generation, !Task.isCancelled else { return }
+                if ScanControl.shared.isInteractiveWorkActive { continue }
                 if capacity.reachedSoftLimit,
                    !ScanConfiguration.allowsIndexGrowthBeyondSoftLimit() {
                     let used = Double(capacity.semanticVectorBytes) / 1_073_741_824
@@ -218,7 +211,65 @@ actor LocalSemanticIndex {
                     }
                     return
                 }
-                let chunks = try db.missingEmbeddings(spaceID: space, rootPaths: snapshot, limit: 8)
+                if let visualSpace, coverage.visualPending,
+                   (preferVisual || !coverage.rawPending && !coverage.summaryPending) {
+                    let candidates = try await Task.detached(priority: .utility) {
+                        try db.missingVisualEmbeddings(spaceID: visualSpace, rootPaths: snapshot, limit: 1)
+                    }.value
+                    if let chunk = candidates.first {
+                        let started = ProcessInfo.processInfo.systemUptime
+                        do {
+                            let image = try await Task.detached(priority: .utility) {
+                                try VisualEmbeddingInput.render(chunk)
+                            }.value
+                            defer { try? FileManager.default.removeItem(at: image) }
+                            try Task.checkCancellation()
+                            if ScanControl.shared.isInteractiveWorkActive || ScanControl.shared.isHeavyModelActive { continue }
+                            let budget = chunk.kind == "visual_page" ? 1120 : 280
+                            let vector = try await LocalGemmaWorker.shared.image([image.path], budget: budget, background: true)[0]
+                            try Task.checkCancellation()
+                            try db.putEmbedding(chunkID: chunk.id, spaceID: visualSpace,
+                                                modelID: LocalGemmaWorker.modelID, modelVersion: digest!,
+                                                vector: vector, rootPaths: snapshot,
+                                                expectedContentHash: chunk.contentHash,
+                                                featureType: "visual_embedding")
+                            try db.clearVisualEmbeddingFailure(chunkID: chunk.id, spaceID: visualSpace)
+                            ScanTiming.record(key: timingKey + ":visual", units: 1,
+                                              seconds: ProcessInfo.processInfo.systemUptime - started)
+                        } catch is CancellationError { continue }
+                        catch DataLayerError.staleVersion { continue }
+                        catch DataLayerError.missingChunk { continue }
+                        catch {
+                            if ScanControl.shared.isInteractiveWorkActive || ScanControl.shared.isHeavyModelActive { continue }
+                            try db.recordVisualEmbeddingFailure(chunkID: chunk.id, spaceID: visualSpace,
+                                                                rootPaths: snapshot, error: String(describing: error))
+                        }
+                        preferVisual = false
+                        continue
+                    }
+                    if !coverage.rawPending && !coverage.summaryPending {
+                        await MainActor.run {
+                            SemanticProgress.shared.phase = .paused
+                            SemanticProgress.shared.text = "部分视觉页面待重试 · 稍后继续"
+                        }
+                        try await Task.sleep(nanoseconds: 5_000_000_000)
+                        continue
+                    }
+                }
+                let targetRaw = coverage.rawPending && (preferRaw || !coverage.summaryPending)
+                if !coverage.rawPending && !coverage.summaryPending {
+                    try await Task.sleep(nanoseconds: 1_000_000_000)
+                    continue
+                }
+                let targetSpace = targetRaw ? rawSpace : space
+                let chunks = try await Task.detached(priority: .utility) {
+                    try db.missingEmbeddings(
+                        spaceID: targetSpace, rootPaths: snapshot, limit: 8,
+                        semanticMethods: targetRaw ? nil : Self.indexedSemanticMethods,
+                        rawTextOnly: targetRaw, includeAllTextKinds: Self.usesGemma
+                    )
+                }.value
+                guard current == generation, !Task.isCancelled else { return }
                 if chunks.isEmpty {
                     await MainActor.run {
                         SemanticProgress.shared.phase = .paused
@@ -226,11 +277,18 @@ actor LocalSemanticIndex {
                     }
                     return
                 }
-                let inputs = chunks.map { String(($0.tags + [$0.text, $0.summary]).joined(separator: "\n").prefix(2400)) }
+                let inputs = chunks.map { chunk in
+                    if targetRaw { return String(chunk.text.prefix(2400)) }
+                    let evidence = chunk.kind == "document"
+                        ? [chunk.summary] + chunk.tags
+                        : [chunk.summary, chunk.text] + chunk.tags
+                    return String(evidence.filter { !$0.isEmpty }.joined(separator: "\n").prefix(2400))
+                }
+                let modelInputs = inputs.map { "title: none | text: " + $0 }
                 let batchStarted = ProcessInfo.processInfo.systemUptime
                 let vectors: [[Float]]
                 do {
-                    vectors = try await embed(inputs)
+                    vectors = try await embed(modelInputs, background: true)
                 } catch let error as URLError where error.code == .cancelled {
                     guard current == generation, !Task.isCancelled else { return }
                     await MainActor.run {
@@ -239,18 +297,28 @@ actor LocalSemanticIndex {
                     }
                     try await Task.sleep(nanoseconds: 1_200_000_000)
                     continue
+                } catch {
+                    if Self.usesGemma && (ScanControl.shared.isInteractiveWorkActive || ScanControl.shared.isHeavyModelActive) {
+                        try await Task.sleep(nanoseconds: 200_000_000)
+                        continue
+                    }
+                    throw error
                 }
                 try Task.checkCancellation()
                 guard current == generation && snapshot == roots else { return }
                 for (chunk, vector) in zip(chunks, vectors) {
                     do {
-                        try db.putEmbedding(chunkID: chunk.id, spaceID: space, modelID: Self.model, modelVersion: digest!, vector: vector,
+                        try db.putEmbedding(chunkID: chunk.id, spaceID: targetSpace,
+                                            modelID: LocalGemmaWorker.modelID,
+                                            modelVersion: digest!, vector: vector,
                                             rootPaths: snapshot, expectedContentHash: chunk.contentHash)
                     } catch DataLayerError.staleVersion { continue }
                     catch DataLayerError.missingChunk { continue }
                 }
                 ScanTiming.record(key: timingKey, units: chunks.count,
                                   seconds: ProcessInfo.processInfo.systemUptime - batchStarted)
+                preferRaw.toggle()
+                preferVisual = true
             }
         } catch is CancellationError { }
         catch {
@@ -269,23 +337,125 @@ actor LocalSemanticIndex {
     func warmUp() async {
         guard ScanConfiguration.semanticEnabled() else { return }
         guard (try? await ensureModel()) != nil else { return }
-        _ = try? await embed(["预热"])
+        _ = try? await embed(["task: search result | query: 预热"])
     }
 
     /// Diagnostics can query existing vectors without scheduling indexing or scanning.
     func prepareSearch(roots requested: [String]) async throws {
-        roots = requested.sorted()
+        let audit = ArchitectureAuditTrace.begin("semantic_prepare")
+        defer { audit?.end() }
+        let requested = requested.sorted()
+        if roots != requested {
+            generation += 1
+            job?.cancel()
+            job = nil
+            roots = requested
+        }
         try await ensureModel()
     }
 
-    /// `minScore` is lowered only by the fallback pass, which has a model to filter the extra noise.
-    func search(query: String, roots requested: [String], minScore: Double = 0.52) async -> [ChunkResult] {
-        await searchProfiled(query: query, roots: requested, minScore: minScore).results
+    /// Explicit opt-in only: never scheduled by the V1 indexer or used by its search lanes.
+    func indexDeepScan(roots requested: [String]) async throws -> DeepScanIndexReport {
+        guard LocalGemmaWorker.isAvailable else { throw GemmaError.notInstalled }
+        let revision = try await LocalGemmaWorker.shared.revision()
+        let deepSpace = "gemma2:" + revision + ":deepscan-summary-v1"
+        let db = try AppDatabase.open()
+        let inputs = try db.deepScanEmbeddingInputs(
+            spaceID: deepSpace, legacySpaceID: "gemma2:" + revision + ":understanding-v1",
+            modelID: LocalGemmaWorker.modelID, modelVersion: revision,
+            dimensions: LocalGemmaWorker.dimensions, rootPaths: requested)
+        var generated = 0
+        var reused = 0
+        var failures: [String] = []
+        func store(_ chunk: ChunkResult, _ vector: [Float]) throws {
+            try db.putEmbedding(chunkID: chunk.id, spaceID: deepSpace,
+                                modelID: LocalGemmaWorker.modelID, modelVersion: revision,
+                                vector: vector, rootPaths: requested, expectedContentHash: chunk.contentHash)
+        }
+        // understanding-v1 used this same document summary + tags prompt, model and content hash.
+        for input in inputs where !input.indexed && input.vector != nil {
+            try Task.checkCancellation()
+            do { try store(input.chunk, input.vector!); reused += 1 }
+            catch { failures.append(input.chunk.path + ": " + String(describing: error)) }
+        }
+        let missing = inputs.filter { !$0.indexed && $0.vector == nil }
+        for offset in stride(from: 0, to: missing.count, by: 4) {
+            try Task.checkCancellation()
+            let batch = Array(missing[offset..<min(offset + 4, missing.count)])
+            let texts = batch.map { input in
+                let evidence = ([input.chunk.summary] + input.chunk.tags).filter { !$0.isEmpty }
+                return "title: none | text: " + String(evidence.joined(separator: "\n").prefix(2400))
+            }
+            do {
+                let vectors = try await LocalGemmaWorker.shared.text(texts)
+                for (input, vector) in zip(batch, vectors) {
+                    do { try store(input.chunk, vector); generated += 1 }
+                    catch { failures.append(input.chunk.path + ": " + String(describing: error)) }
+                }
+            } catch is CancellationError { throw CancellationError() }
+            catch {
+                failures += batch.map { $0.chunk.path + ": " + String(describing: error) }
+            }
+        }
+        return DeepScanIndexReport(space: deepSpace, total: inputs.count, generated: generated,
+                                   reused: reused, skipped: inputs.filter(\.indexed).count, failures: failures)
+    }
+
+    /// Independent cosine Top K. No V1 lanes, fusion, display thresholds or reranker are involved.
+    func searchDeepScan(query: String, roots requested: [String], topK: Int,
+                        readOnly: Bool = false) async throws -> [ChunkResult] {
+        guard !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, topK > 0 else { return [] }
+        guard LocalGemmaWorker.isAvailable else { throw GemmaError.notInstalled }
+        let revision = try await LocalGemmaWorker.shared.revision()
+        let deepSpace = "gemma2:" + revision + ":deepscan-summary-v1"
+        let db = try AppDatabase.open(readOnly: readOnly)
+        let eligible = try db.deepScanEmbeddingInputs(
+            spaceID: deepSpace, legacySpaceID: "gemma2:" + revision + ":understanding-v1",
+            modelID: LocalGemmaWorker.modelID, modelVersion: revision,
+            dimensions: LocalGemmaWorker.dimensions, rootPaths: requested)
+        let ids = Set(eligible.filter(\.indexed).map { $0.chunk.id })
+        guard !ids.isEmpty else { return [] }
+        let key = "gemma2:" + revision + ":understanding-v1:" + query
+        let vector: [Float]
+        if let cached = queryCache[key] {
+            vector = cached
+        } else {
+            vector = try await LocalGemmaWorker.shared.text(["task: search result | query: " + String(query.prefix(1000))])[0]
+            if queryCache.count >= 64 { queryCache.removeAll() }
+            queryCache[key] = vector
+        }
+        try Task.checkCancellation()
+        return Array(try db.searchVector(vector, spaceID: deepSpace, rootPaths: requested,
+                                        limit: eligible.count).filter { ids.contains($0.id) }.prefix(topK))
+            .map { $0.from("deepscan") }
+    }
+
+    /// Keep the first pass recall-oriented; the caller selects the display threshold.
+    func search(query: String, roots requested: [String], minScore: Double = 0.50,
+                candidateLimit: Int? = nil) async -> [ChunkResult] {
+        await searchProfiled(query: query, roots: requested, minScore: minScore, candidateLimit: candidateLimit).results
+    }
+
+    func search(imageURL: URL, roots requested: [String]) async throws -> [ChunkResult] {
+        guard Self.usesGemma else { return [] }
+        try await ensureModel()
+        guard let visualSpace else { return [] }
+        let image = try await Task.detached(priority: .userInitiated) {
+            try VisualEmbeddingInput.renderQuery(imageURL)
+        }.value
+        defer { try? FileManager.default.removeItem(at: image) }
+        let vector = try await LocalGemmaWorker.shared.image([image.path], budget: 280)[0]
+        let db = try AppDatabase.open()
+        return try db.searchVectorProfiled(vector, spaceID: visualSpace, rootPaths: requested,
+                                           limit: 120, featureType: "visual_embedding").matches
+            .map { $0.from("visual") }
     }
 
     func searchProfiled(
-        query: String, roots requested: [String], minScore: Double = 0.52
+        query: String, roots requested: [String], minScore: Double = 0.50, candidateLimit: Int? = nil
     ) async -> SemanticSearchProfile {
+        let audit = ArchitectureAuditTrace.begin("semantic_total")
+        defer { audit?.end() }
         let totalStarted = ProcessInfo.processInfo.systemUptime
         guard ScanConfiguration.semanticEnabled() else {
             return emptyProfile(startedAt: totalStarted, error: "semantic models disabled")
@@ -293,7 +463,7 @@ actor LocalSemanticIndex {
         guard requested.sorted() == roots else {
             return emptyProfile(startedAt: totalStarted, error: "semantic roots changed")
         }
-        guard let space else {
+        guard let space, let rawSpace else {
             return emptyProfile(startedAt: totalStarted, error: "semantic model space unavailable")
         }
         guard !query.isEmpty else {
@@ -308,7 +478,7 @@ actor LocalSemanticIndex {
                 vector = cached
                 cacheHit = true
             } else {
-                let instruction = "Instruct: Given a file search query, retrieve relevant document passages or image descriptions.\nQuery: "
+                let instruction = "task: search result | query: "
                 vector = try await embed([instruction + String(query.prefix(1000))])[0]
                 if queryCache.count >= 64 { queryCache.removeAll() }
                 queryCache[key] = vector
@@ -320,24 +490,73 @@ actor LocalSemanticIndex {
             guard requested.sorted() == roots else {
                 return emptyProfile(startedAt: totalStarted, error: "semantic roots changed")
             }
-            let vectorOutput = try AppDatabase.open().searchVectorProfiled(
-                vector, spaceID: space, rootPaths: requested, limit: 80
+            let db = try AppDatabase.open()
+            let auditSummary = ArchitectureAuditTrace.begin("vector_summary")
+            let vectorOutput = Self.usesGemma ? Self.emptyVectorOutput() : try db.searchVectorProfiled(
+                vector, spaceID: space, rootPaths: requested, limit: candidateLimit ?? 80
             )
+            auditSummary?.end(count: vectorOutput.matches.count, fields: Self.auditFields(vectorOutput.diagnostics))
+            let auditRaw = ArchitectureAuditTrace.begin("vector_raw")
+            let rawOutput = try db.searchVectorProfiled(
+                vector, spaceID: rawSpace, rootPaths: requested, limit: candidateLimit ?? 160,
+                v1RawTextOnly: Self.usesGemma
+            )
+            auditRaw?.end(count: rawOutput.matches.count, fields: Self.auditFields(rawOutput.diagnostics))
+            let auditVisual = ArchitectureAuditTrace.begin("vector_visual")
+            let visualOutput = Self.usesGemma && visualSpace != nil
+                ? try db.searchVectorProfiled(vector, spaceID: visualSpace!, rootPaths: requested,
+                                              limit: candidateLimit ?? 120, featureType: "visual_embedding") : nil
+            auditVisual?.end(count: visualOutput?.matches.count ?? 0,
+                             fields: visualOutput.map { Self.auditFields($0.diagnostics) } ?? [:])
             let thresholdStarted = ProcessInfo.processInfo.systemUptime
-            let accepted = vectorOutput.matches.filter { $0.score >= minScore }
+            let auditFusion = ArchitectureAuditTrace.begin("semantic_file_dedup_rrf")
+            let summary = vectorOutput.matches
+            let rawAboveThreshold = rawOutput.matches
+            var rawPerFile: [String: Int] = [:]
+            let raw = rawAboveThreshold.filter { chunk in
+                guard rawPerFile[chunk.path, default: 0] < 2 else { return false }
+                rawPerFile[chunk.path, default: 0] += 1
+                return true
+            }
+            let lanes = [summary.map { $0.from("summary") }, raw.map { $0.from("raw_text") },
+                         (visualOutput?.matches ?? []).map { $0.from("visual") }]
+            let paths = RankFusion.fuse(lanes.map { $0.map(\.path) }, limit: candidateLimit ?? 120)
+            let accepted = paths.flatMap { path in
+                lanes.compactMap { lane in lane.first(where: { $0.path == path }) }
+            }
+            let summaryDiagnostics = vectorOutput.diagnostics
+            let rawDiagnostics = rawOutput.diagnostics
+            let visualDiagnostics = visualOutput?.diagnostics
+            let diagnostics = VectorSearchDiagnostics(
+                scannedVectors: summaryDiagnostics.scannedVectors + rawDiagnostics.scannedVectors + (visualDiagnostics?.scannedVectors ?? 0),
+                connectionWaitMilliseconds: summaryDiagnostics.connectionWaitMilliseconds + rawDiagnostics.connectionWaitMilliseconds + (visualDiagnostics?.connectionWaitMilliseconds ?? 0),
+                metadataReadMilliseconds: summaryDiagnostics.metadataReadMilliseconds + rawDiagnostics.metadataReadMilliseconds + (visualDiagnostics?.metadataReadMilliseconds ?? 0),
+                candidateReadMilliseconds: summaryDiagnostics.candidateReadMilliseconds + rawDiagnostics.candidateReadMilliseconds + (visualDiagnostics?.candidateReadMilliseconds ?? 0),
+                cosineMilliseconds: summaryDiagnostics.cosineMilliseconds + rawDiagnostics.cosineMilliseconds + (visualDiagnostics?.cosineMilliseconds ?? 0),
+                detailReadMilliseconds: summaryDiagnostics.detailReadMilliseconds + rawDiagnostics.detailReadMilliseconds + (visualDiagnostics?.detailReadMilliseconds ?? 0),
+                totalMilliseconds: summaryDiagnostics.totalMilliseconds + rawDiagnostics.totalMilliseconds + (visualDiagnostics?.totalMilliseconds ?? 0),
+                highestScore: accepted.first?.score,
+                lowestTopScore: [summaryDiagnostics.lowestTopScore, rawDiagnostics.lowestTopScore, visualDiagnostics?.lowestTopScore]
+                    .compactMap { $0 }.min()
+            )
+            auditFusion?.end(count: accepted.count, fields: ["query_cache_hit": cacheHit])
             let thresholdMilliseconds =
                 (ProcessInfo.processInfo.systemUptime - thresholdStarted) * 1_000
+            SearchRuleAblationDiagnostics.lanes(query: query, vector: vector,
+                summary: vectorOutput.matches, raw: rawOutput.matches, rawTopTwo: raw,
+                visual: visualOutput?.matches ?? [], accepted: accepted)
             return SemanticSearchProfile(
                 results: accepted,
                 embeddingMilliseconds: embeddingMilliseconds,
-                vectorDiagnostics: vectorOutput.diagnostics,
+                vectorDiagnostics: diagnostics,
                 thresholdMilliseconds: thresholdMilliseconds,
                 totalMilliseconds:
                     (ProcessInfo.processInfo.systemUptime - totalStarted) * 1_000,
                 queryVectorCacheHit: cacheHit,
-                topKBeforeThreshold: vectorOutput.matches.count,
-                topKRejectedByThreshold: vectorOutput.matches.count - accepted.count,
-                highestScore: vectorOutput.diagnostics.highestScore,
+                topKBeforeThreshold: vectorOutput.matches.count + rawOutput.matches.count + (visualOutput?.matches.count ?? 0),
+                topKRejectedByThreshold: vectorOutput.matches.count + rawOutput.matches.count
+                    - summary.count - rawAboveThreshold.count,
+                highestScore: diagnostics.highestScore,
                 lowestAcceptedScore: accepted.last?.score,
                 error: nil
             )
@@ -346,6 +565,20 @@ actor LocalSemanticIndex {
             AppLog.write("local-semantic-search: \(message)")
             return emptyProfile(startedAt: totalStarted, error: message)
         }
+    }
+
+    private static func auditFields(_ d: VectorSearchDiagnostics) -> [String: Any] {
+        ["scanned": d.scannedVectors, "sql_connection_wait_ms": d.connectionWaitMilliseconds,
+         "metadata_ms": d.metadataReadMilliseconds, "vector_read_ms": d.candidateReadMilliseconds,
+         "cosine_ms": d.cosineMilliseconds, "detail_sql_ms": d.detailReadMilliseconds]
+    }
+
+    private static func emptyVectorOutput() -> VectorSearchOutput {
+        VectorSearchOutput(matches: [], diagnostics: VectorSearchDiagnostics(
+            scannedVectors: 0, connectionWaitMilliseconds: 0, metadataReadMilliseconds: 0,
+            candidateReadMilliseconds: 0, cosineMilliseconds: 0, detailReadMilliseconds: 0,
+            totalMilliseconds: 0, highestScore: nil, lowestTopScore: nil
+        ))
     }
 
     private func emptyProfile(startedAt: TimeInterval, error: String) -> SemanticSearchProfile {

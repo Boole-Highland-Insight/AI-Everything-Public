@@ -2,6 +2,13 @@ import AppKit
 import PDFKit
 import SwiftUI
 import QuickLookThumbnailing
+import UniformTypeIdentifiers
+import AIEData
+
+private enum SearchRetrievalStage {
+    case lexical([FileHit], milliseconds: Double)
+    case semantic([ChunkResult], milliseconds: Double)
+}
 
 final class SearchModel: ObservableObject {
     @Published var files: [IndexedFile] = [] {
@@ -10,7 +17,15 @@ final class SearchModel: ObservableObject {
     @Published var query = "" {
         didSet {
             guard !isPreview else { return }
+            if query != "以图搜索" { imageQueryURL = nil }
             let normalized = query.trimmingCharacters(in: .whitespacesAndNewlines)
+            if query != oldValue {
+                firstResultTiming = normalized.isEmpty || imageQueryURL != nil
+                    ? nil : ArchitectureAuditTrace.begin("ui_input_to_first_row")
+            }
+            let auditInput = normalized.isEmpty || imageQueryURL != nil
+                ? nil : ArchitectureAuditTrace.begin("ui_input_sync")
+            defer { auditInput?.end(id: auditTraceID) }
             if submittedQuery != normalized {
                 submittedQuery = nil
             }
@@ -21,6 +36,11 @@ final class SearchModel: ObservableObject {
         }
     }
     @Published var hits: [FileHit] = []
+    @Published private(set) var canExpandSearch = false
+    private var retrievedSemantic: [ChunkResult] = []
+    private var auditTraceID: String?
+    private var auditAppeared = false
+    private var firstResultTiming: ArchitectureAuditTrace.Span?
     @Published private(set) var lastSearchTrace: SearchTrace?
     @Published private(set) var tabSuggestions: [AITabSuggestion] = []
     @Published private(set) var tabSuggestionIndex = 0
@@ -35,8 +55,7 @@ final class SearchModel: ObservableObject {
     @Published var isLoading = false
     @Published var fastSearching = false
     @Published var reranking = false
-    @Published var deepSearching = false
-    @Published var precisionSearching = false
+    @Published var searchProgress: Double?
     @Published var remoteReady = false
     @Published var remoteSettingsError: String?
     @Published var recycleMode = false
@@ -69,12 +88,15 @@ final class SearchModel: ObservableObject {
     private var queuedReloadProminent = false
     private var rerankTask: Task<Void, Never>?
     private var localSearchTask: Task<Void, Never>?
+    private var imageQueryURL: URL?
     private var submittedQuery: String?
     private var searchGeneration = 0
+    private var searchedFileCount = 0
     private static let searchQueue = DispatchQueue(label: "aie.search", qos: .userInitiated)
     private var rerankToken = 0
     private var automaticJevSignature: String?
     private var automaticJevHits: [FileHit] = []
+    private var automaticRerankerWasBGE = false
     private var reuseTask: Task<Void, Never>?
     private var reuseAnchor: String?
     private var didRestoreReuseSession = false
@@ -92,6 +114,15 @@ final class SearchModel: ObservableObject {
         if let photoObserver { NotificationCenter.default.removeObserver(photoObserver) }
     }
 
+    /// An existing database snapshot for read-only UI evaluation: no watchers or startup scan.
+    init(indexedFiles: [IndexedFile], roots: [URL]) {
+        isPreview = false
+        self.files = indexedFiles
+        self.roots = roots
+        started = true
+        status = "已发现 \(indexedFiles.count) 个文件"
+    }
+
     init(previewFiles: [IndexedFile]? = nil) {
         isPreview = previewFiles != nil
         if let previewFiles {
@@ -107,8 +138,14 @@ final class SearchModel: ObservableObject {
         photoObserver = NotificationCenter.default.addObserver(forName: .aiePhotoSnapshotsChanged, object: nil, queue: .main) { [weak self] _ in
             self?.reload(prominent: false)
         }
-        scanConfigurationObserver = NotificationCenter.default.addObserver(forName: ScanConfiguration.changed, object: nil, queue: .main) { [weak self] _ in
+        scanConfigurationObserver = NotificationCenter.default.addObserver(forName: ScanConfiguration.changed, object: nil, queue: .main) { [weak self] notification in
             guard let self, self.started else { return }
+            if notification.userInfo?["backgroundOnly"] as? Bool == true {
+                if ScanConfiguration.backgroundUnderstandingCanRun(), !VisionEnricher.isBusy {
+                    QuickScanner.enqueueMissing(files: self.files) { [weak self] in self?.onScanIdle() }
+                }
+                return
+            }
             if ScanConfiguration.semanticEnabled() { self.reload(prominent: false) }
         }
         databaseTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
@@ -302,17 +339,23 @@ final class SearchModel: ObservableObject {
             return
         }
         loading = true
+        ScanProgress.shared.beginDiscovery()
         isLoading = true
         let roots = self.roots
         let generation = rootsGeneration
         let showProgress = prominent
+        let catalogID = ArchitectureAuditTrace.enabled ? (ArchitectureAuditTrace.traceID ?? UUID().uuidString) : nil
+        let catalogQueue = ArchitectureAuditTrace.begin("catalog_queue_wait", id: catalogID)
         DispatchQueue.global(qos: .userInitiated).async {
+            catalogQueue?.end()
+            let catalogLoad = ArchitectureAuditTrace.begin("catalog_load", id: catalogID)
             let files = LibraryGateway.load(
                 roots: roots,
                 catalogReady: { catalog in
                     DispatchQueue.main.async {
                         guard self.rootsGeneration == generation else { return }
                         self.files = catalog
+                        ArchitectureAuditTrace.event("ui_catalog_discovered", id: catalogID, count: catalog.count)
                         ScanProgress.shared.setCatalogReady(count: catalog.count)
                         ScanProgress.shared.beginIndexing(total: catalog.count)
                         self.refreshAfterIndexUpdate()
@@ -328,7 +371,10 @@ final class SearchModel: ObservableObject {
                     }
                 }
             )
+            catalogLoad?.end(count: files.count)
+            let catalogPublishWait = ArchitectureAuditTrace.begin("catalog_main_queue_wait", id: catalogID)
             DispatchQueue.main.async {
+                catalogPublishWait?.end()
                 self.loading = false
                 guard self.rootsGeneration == generation else {
                     self.files = []
@@ -337,6 +383,7 @@ final class SearchModel: ObservableObject {
                     return
                 }
                 self.files = files
+                ArchitectureAuditTrace.event("ui_catalog_loaded", id: catalogID, count: files.count)
                 if let error = LibraryGateway.lastError {
                     DeviceSetup.shared.markIndexFailed(error)
                 } else {
@@ -388,6 +435,13 @@ final class SearchModel: ObservableObject {
         reloadIndexOnly()
     }
 
+    func retryDeepUnderstanding() {
+        guard ScanConfiguration.backgroundUnderstandingCanRun(),
+              !VisionEnricher.isBusy, !QuickScanner.isBusy else { return }
+        _ = try? AppDatabase.open().retryFailedJobs(jobTypes: ["deep"])
+        QuickScanner.enqueueMissing(files: files) { [weak self] in self?.onScanIdle() }
+    }
+
     func repairSummaries() {
         guard !VisionEnricher.isBusy, !QuickScanner.isBusy,
               remoteReady || LocalQuickScan.isInstalled
@@ -424,14 +478,27 @@ final class SearchModel: ObservableObject {
         guard started else { return }
         if loading || indexReloading { indexReloadQueued = true; return }
         indexReloading = true
+        ScanProgress.shared.beginDiscovery()
         indexReloadQueued = false
         let roots = self.roots
         let generation = rootsGeneration
         DispatchQueue.global(qos: .utility).async {
-            let files = LibraryGateway.load(roots: roots)
+            let files = LibraryGateway.load(roots: roots, catalogReady: { catalog in
+                DispatchQueue.main.async {
+                    guard self.rootsGeneration == generation else { return }
+                    ScanProgress.shared.setCatalogReady(count: catalog.count)
+                    ScanProgress.shared.beginIndexing(total: catalog.count)
+                }
+            }, indexProgress: { completed, total in
+                DispatchQueue.main.async {
+                    guard self.rootsGeneration == generation else { return }
+                    ScanProgress.shared.updateIndexing(completed: completed, total: total)
+                }
+            })
             DispatchQueue.main.async {
                 self.indexReloading = false
                 if self.rootsGeneration == generation {
+                    ScanProgress.shared.finishIndexing(completed: LibraryGateway.lastError == nil)
                     self.files = files
                     self.updateSemanticIndex()
                     self.junk = JunkClassifier.classify(files)
@@ -455,7 +522,11 @@ final class SearchModel: ObservableObject {
     }
 
     func refreshAfterIndexUpdate() {
-        guard !hasActiveQuery || !searchInProgress else { return }
+        if hasActiveQuery {
+            // A query entered while the initial catalog was empty must run once files arrive.
+            // Later background enrichment must not repeatedly replace the visible results.
+            guard searchedFileCount == 0, !files.isEmpty else { return }
+        }
         refresh()
     }
 
@@ -498,13 +569,37 @@ final class SearchModel: ObservableObject {
         let generation = searchGeneration
         let request = SearchRequestVersion(generation: generation, query: query)
         localSearchTask?.cancel()
+        canExpandSearch = false
+        retrievedSemantic = []
         fastSearching = false
         let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
         rerankTask?.cancel()
         reranking = false
-        deepSearching = false
-        precisionSearching = false
+        if let imageQueryURL {
+            let snapshot = files
+            let rootSnapshot = roots.map(\.path)
+            ScanControl.shared.noteInteractiveWork(settleAfter: 5)
+            hits = []
+            fastSearching = true
+            status = "正在以图搜索…"
+            localSearchTask = Task { @MainActor [weak self] in
+                guard let self else { return }
+                do {
+                    let matches = try await LocalSemanticIndex.shared.search(imageURL: imageQueryURL, roots: rootSnapshot)
+                    guard !Task.isCancelled, request.matches(generation: self.searchGeneration, query: self.query) else { return }
+                    self.hits = LibraryGateway.visualCandidates(matches, in: snapshot)
+                    self.selected = self.hits.first?.id
+                    self.status = "以图找到 \(self.hits.count) 个文件"
+                } catch {
+                    self.status = "以图搜索暂不可用 · \(error.localizedDescription)"
+                }
+                self.fastSearching = false
+            }
+            return
+        }
         if q.isEmpty {
+            searchProgress = nil
+            searchedFileCount = files.count
             hits = files
                 .sorted { $0.mtime > $1.mtime }
                 .prefix(20)
@@ -521,36 +616,139 @@ final class SearchModel: ObservableObject {
                 }
             status = files.isEmpty
                 ? (isLoading ? "正在索引…" : (roots.isEmpty ? "未选择资料夹" : "这个资料夹是空的"))
-                : "已索引 \(files.count) 个文件"
+                : (ScanProgress.shared.indexing || ScanProgress.shared.catalogDiscovering
+                    ? "已发现 \(files.count) 个文件 · 已完成基础索引 \(ScanProgress.shared.indexedFiles) 个"
+                    : "已发现 \(files.count) 个文件")
         } else {
             let snapshot = files
+            let rootSnapshot = roots.map(\.path)
+            ScanControl.shared.noteInteractiveWork(settleAfter: 5)
+            searchedFileCount = snapshot.count
             let trace = SearchTraceSession()
-            trace.recordRouting(SearchRouter.route(q))
+            auditTraceID = trace.id.uuidString
+            auditAppeared = false
+            let auditQuery = ArchitectureAuditTrace.begin("query_to_stable", id: trace.id.uuidString)
+            let auditSchedule = ArchitectureAuditTrace.begin("ui_task_scheduling", id: trace.id.uuidString)
+            let routing = SearchRouter.route(q)
+            trace.recordRouting(routing)
+            hits = []
+            selected = nil
             fastSearching = true
-            status = "正在搜索…"
+            searchProgress = 0.08
+            status = routing.uses(.semantic) ? "正在进行语义检索…" : "正在搜索…"
             localSearchTask = Task { @MainActor [weak self] in
-                do { try await Task.sleep(nanoseconds: 120_000_000) }
+                await ArchitectureAuditTrace.$traceID.withValue(trace.id.uuidString) {
+                auditSchedule?.end()
+                defer { auditQuery?.end() }
+                let debounce = ArchitectureAuditTrace.begin("ui_debounce")
+                // Small catalogs do not need the large-library typing delay.
+                do { try await Task.sleep(nanoseconds: snapshot.count <= 200 ? 20_000_000 : 120_000_000) }
                 catch { return }
-                let local = await withCheckedContinuation { continuation in
-                    Self.searchQueue.async {
-                        continuation.resume(returning: trace.measure(
-                            "fast_retrieval",
-                            operation: { LibraryGateway.searchCandidates(query: q, in: snapshot) },
-                            candidates: \.count
-                        ))
+                debounce?.end()
+                var first: [FileHit] = []
+                var wideSemantic: [ChunkResult] = []
+                if routing.uses(.semantic) {
+                    var lexical: [FileHit] = []
+                    var semanticHits: [FileHit] = []
+                    await withTaskGroup(of: SearchRetrievalStage.self) { group in
+                        group.addTask {
+                            let started = ProcessInfo.processInfo.systemUptime
+                            let hits = await withCheckedContinuation { continuation in
+                                Self.searchQueue.async {
+                                    ArchitectureAuditTrace.$traceID.withValue(trace.id.uuidString) {
+                                    continuation.resume(returning: LibraryGateway.searchCandidates(
+                                        query: q, in: snapshot).map(\.hit))
+                                    }
+                                }
+                            }
+                            return .lexical(
+                                hits,
+                                milliseconds: (ProcessInfo.processInfo.systemUptime - started) * 1_000)
+                        }
+                        group.addTask {
+                            let started = ProcessInfo.processInfo.systemUptime
+                            try? await LocalSemanticIndex.shared.prepareSearch(roots: rootSnapshot)
+                            let semantic = await LocalSemanticIndex.shared.search(
+                                query: q, roots: rootSnapshot,
+                                minScore: LocalRerank.precisionWideMinScore,
+                                candidateLimit: snapshot.count <= 200 && LocalSemanticIndex.usesGemma ? 1000 : nil)
+                            return .semantic(
+                                semantic,
+                                milliseconds: (ProcessInfo.processInfo.systemUptime - started) * 1_000)
+                        }
+                        for await stage in group {
+                            guard let self, !Task.isCancelled,
+                                  request.matches(generation: self.searchGeneration, query: self.query)
+                            else {
+                                group.cancelAll()
+                                return
+                            }
+                            switch stage {
+                            case .lexical(let hits, let milliseconds):
+                                lexical = hits
+                                trace.record("fast_retrieval", milliseconds: milliseconds, candidates: hits.count)
+                                self.searchProgress = 0.32
+                                if !hits.isEmpty || !semanticHits.isEmpty {
+                                    first = Array(SearchResultMerge.merge(lexical: hits, semantic: semanticHits).prefix(30))
+                                    self.hits = first
+                                    ArchitectureAuditTrace.event("ui_publish_lexical", count: first.count)
+                                    self.selected = first.first?.id
+                                    self.status = self.statusLine(count: first.count, query: q, remote: false)
+                                }
+                            case .semantic(let semantic, let milliseconds):
+                                trace.record("semantic_retrieval", milliseconds: milliseconds, candidates: semantic.count)
+                                wideSemantic = semantic
+                                semanticHits = await withCheckedContinuation { continuation in
+                                    Self.searchQueue.async {
+                                        ArchitectureAuditTrace.$traceID.withValue(trace.id.uuidString) {
+                                        continuation.resume(returning: LibraryGateway.searchCandidates(
+                                            query: q, in: snapshot,
+                                            semantic: LocalSemanticIndex.usesGemma
+                                                ? semantic : semantic.filter { $0.score >= 0.50 }).map(\.hit))
+                                        }
+                                    }
+                                }
+                                guard !Task.isCancelled,
+                                      request.matches(generation: self.searchGeneration, query: self.query)
+                                else { group.cancelAll(); return }
+                                first = Array(SearchResultMerge.merge(lexical: lexical, semantic: semanticHits).prefix(30))
+                                self.searchProgress = 0.68
+                                if !first.isEmpty {
+                                    self.hits = first
+                                    ArchitectureAuditTrace.event("ui_publish_hybrid", count: first.count)
+                                    self.selected = first.first?.id
+                                    self.status = self.statusLine(count: first.count, query: q, remote: false)
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    first = await withCheckedContinuation { continuation in
+                        Self.searchQueue.async {
+                            continuation.resume(returning: trace.measure(
+                                "fast_retrieval",
+                                operation: {
+                                    LibraryGateway.searchCandidates(query: q, in: snapshot).map(\.hit)
+                                },
+                                candidates: \.count
+                            ))
+                        }
                     }
                 }
                 guard let self, !Task.isCancelled,
                       request.matches(generation: self.searchGeneration, query: self.query) else { return }
                 self.fastSearching = false
-                let localHits = local.map(\.hit)
-                self.hits = localHits
-                self.status = self.statusLine(count: local.count, query: q, remote: false)
+                self.hits = first
+                self.retrievedSemantic = wideSemantic
+                self.canExpandSearch = first.count >= 30
+                self.searchProgress = routing.uses(.semantic) ? 0.72 : nil
+                self.status = self.statusLine(count: first.count, query: q, remote: false)
                 if let error = LibraryGateway.lastError { self.status += " · " + error }
-                if self.selected == nil || !localHits.contains(where: { $0.id == self.selected }) {
-                    self.selected = localHits.first?.id
+                if self.selected == nil || !first.contains(where: { $0.id == self.selected }) {
+                    self.selected = first.first?.id
                 }
-                self.scheduleRerank(query: q, local: localHits, trace: trace)
+                self.scheduleRerank(query: q, local: first, wideSemantic: wideSemantic, trace: trace)
+                }
             }
         }
         if let databaseError = LibraryGateway.lastError { status += " · " + databaseError }
@@ -562,14 +760,52 @@ final class SearchModel: ObservableObject {
         selected = hits.first?.id
     }
 
-    var searchInProgress: Bool {
-        fastSearching || reranking || deepSearching || precisionSearching
+    func beginImageSearch(_ url: URL) {
+        imageQueryURL = url
+        query = "以图搜索"
     }
 
-    var jevPrecisionReady: Bool { JevRerank.usesLocalEndpoint || JevRerank.hasKey }
+    func auditResultAppeared(_ path: String) {
+        guard ArchitectureAuditTrace.enabled, !auditAppeared, hits.first?.path == path else { return }
+        auditAppeared = true
+        ArchitectureAuditTrace.event("ui_first_row_onAppear", id: auditTraceID, count: hits.count)
+        firstResultTiming?.end(id: auditTraceID, count: hits.count)
+        firstResultTiming = nil
+    }
 
-    /// Search is live and Jev automatically refines settled queries. Return only commits the
-    /// current query; explicit precision search remains a separate, wider second pass.
+    func expandSearchResults() {
+        guard canExpandSearch, !searchInProgress else { return }
+        let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        let request = SearchRequestVersion(generation: searchGeneration, query: q)
+        let snapshot = files, semantic = retrievedSemantic
+        canExpandSearch = false
+        fastSearching = true
+        localSearchTask = Task { @MainActor [weak self] in
+            let expanded = await withCheckedContinuation { continuation in
+                Self.searchQueue.async {
+                    continuation.resume(returning: LibraryGateway.search(
+                        query: q, in: snapshot, semantic: semantic, limit: max(snapshot.count, 120)))
+                }
+            }
+            guard let self, !Task.isCancelled,
+                  request.matches(generation: self.searchGeneration, query: self.query) else { return }
+            self.fastSearching = false
+            self.hits = SearchResultMerge.merge(lexical: self.hits, semantic: expanded)
+            self.status = "显示 \(self.hits.count) 个候选 · 按相关度排序"
+        }
+    }
+
+    var searchInProgress: Bool {
+        fastSearching || reranking
+    }
+
+    var jevReady: Bool {
+        UserDefaults.standard.bool(forKey: "aie.search.automaticRerank")
+            && (LocalBGERerank.isAvailable || (!AIEApplicationPaths.isCleanV2 && (JevRerank.usesLocalEndpoint || JevRerank.hasKey)))
+    }
+    private var automaticRerankerName: String { LocalBGERerank.isAvailable ? "BGE" : "Jev" }
+
+    /// Search is live and Jev automatically refines settled queries. Return only commits the query.
     @MainActor
     func handleReturn() -> Bool {
         if recycleMode { return openSelected() }
@@ -577,197 +813,166 @@ final class SearchModel: ObservableObject {
         guard !q.isEmpty else { return false }
         submittedQuery = q
         if fastSearching {
-            status = jevPrecisionReady ? "正在搜索，Jev 将自动整理结果…" : "正在搜索…"
+            status = jevReady ? "正在搜索，\(automaticRerankerName) 将自动整理结果…" : "正在搜索…"
         }
         return false
-    }
-
-    @MainActor
-    func startPrecisionSearch() {
-        let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !q.isEmpty else { return }
-        guard jevPrecisionReady else {
-            status = "未配置 OpenRouter API Key，无法使用 Jev 精搜"
-            return
-        }
-        let compiled = LibraryIndex.compile(q)
-        guard !compiled.tokens.isEmpty || !compiled.anyOf.isEmpty else { return }
-        rerankTask?.cancel()
-        rerankToken += 1
-        let token = rerankToken
-        let snapshot = files
-        let rootSnapshot = roots.map(\.path)
-        let current = hits
-        let trace = SearchTraceSession()
-        trace.recordRouting(SearchRouter.route(q))
-        reranking = false
-        deepSearching = false
-        precisionSearching = true
-        status = "精搜 · 正在召回候选…"
-        rerankTask = Task { @MainActor in
-            func stillCurrent() -> Bool {
-                !Task.isCancelled && token == rerankToken && query.trimmingCharacters(in: .whitespacesAndNewlines) == q
-            }
-            defer {
-                if token == rerankToken,
-                   query.trimmingCharacters(in: .whitespacesAndNewlines) == q {
-                    precisionSearching = false
-                    lastSearchTrace = trace.finish(hits: hits)
-                }
-            }
-            let semanticStarted = ProcessInfo.processInfo.systemUptime
-            let semantic = await LocalSemanticIndex.shared.search(
-                query: q, roots: rootSnapshot, minScore: LocalRerank.precisionWideMinScore)
-            trace.record("precision_semantic", startedAt: semanticStarted, candidates: semantic.count)
-            guard stillCurrent() else { return }
-            let initial = await withCheckedContinuation { continuation in
-                Self.searchQueue.async {
-                    continuation.resume(returning: LibraryGateway.fallbackCandidates(
-                        query: q,
-                        in: snapshot,
-                        semantic: semantic,
-                        limit: JevRerank.candidateLimit
-                    ))
-                }
-            }
-            guard stillCurrent() else { return }
-            let candidates = Self.precisionPool(
-                current: current, widened: initial, limit: JevRerank.candidateLimit)
-            guard !candidates.isEmpty else {
-                status = statusLine(count: hits.count, query: q, remote: false) + " · 精搜没有找到新候选"
-                return
-            }
-            status = "精搜 · Jev 正在判断 \(candidates.count) 条候选…"
-            let judgeStarted = ProcessInfo.processInfo.systemUptime
-            let outcome = await JevRerank.rerank(
-                query: q, hits: candidates, files: snapshot, dropSeriouslyIrrelevant: true)
-            trace.record("precision_jev", startedAt: judgeStarted, candidates: outcome.requests)
-            guard stillCurrent() else { return }
-            hits = outcome.hits
-            if selected == nil || !hits.contains(where: { $0.id == selected }) {
-                selected = hits.first?.id
-            }
-            let base = statusLine(count: hits.count, query: q, remote: false)
-            if outcome.requests == 0 {
-                status = base + " · " + (JevRerank.lastError ?? "Jev 没有返回判断")
-            } else if outcome.errors > 0 {
-                status = base + " · Jev 有 \(outcome.errors) 条没判完" + droppedNote(outcome.dropped)
-            } else {
-                status = base + " · Jev 精搜完成" + droppedNote(outcome.dropped)
-            }
-        }
     }
 
     private func droppedNote(_ count: Int) -> String {
         count > 0 ? " · 已从可能结果去掉 \(count) 条严重不相关" : ""
     }
 
-    private static func precisionPool(current: [FileHit], widened: [FileHit], limit: Int) -> [FileHit] {
-        var seen = Set<String>()
-        var pool: [FileHit] = []
-        for hit in current.prefix(min(current.count, 12)) where seen.insert(hit.path).inserted {
-            pool.append(hit)
-        }
-        for hit in widened where seen.insert(hit.path).inserted {
-            pool.append(hit)
-            if pool.count >= limit { break }
-        }
-        return pool
-    }
-
-    private func scheduleRerank(query q: String, local: [FileHit], trace: SearchTraceSession) {
+    private func scheduleRerank(query q: String, local: [FileHit], wideSemantic: [ChunkResult], trace: SearchTraceSession) {
         let routing = SearchRouter.route(q)
-        guard routing.uses(.semantic) else {
+        let localOnly = AIEApplicationPaths.isCleanV2
+        guard localOnly ? jevReady
+              : (routing.uses(.semantic) && (jevReady || (remoteReady && APIConfiguration.cloudRerankEnabled))) else {
+            searchProgress = nil
             lastSearchTrace = trace.finish(hits: local)
             return
         }
         rerankToken += 1
         let token = rerankToken
+        let request = SearchRequestVersion(generation: searchGeneration, query: q)
         let snapshot = files
         let rootSnapshot = roots.map(\.path)
         reranking = true
+        searchProgress = 0.78
         status = statusLine(count: local.count, query: q, remote: false)
-            + (jevPrecisionReady && !local.isEmpty ? " · Jev 正在整理…" : " · 正在补充语义结果…")
+            + (jevReady ? " · \(automaticRerankerName) 正在整理…" : " · 正在补充候选…")
         rerankTask = Task { @MainActor in
+            let auditRerank = ArchitectureAuditTrace.begin("rerank_to_stable", id: trace.id.uuidString)
+            var enhancedPublished = false
             defer {
+                auditRerank?.end(count: hits.count)
                 if token == rerankToken,
                    query.trimmingCharacters(in: .whitespacesAndNewlines) == q {
+                    reranking = false
+                    searchProgress = nil
+                    if localOnly && !enhancedPublished {
+                        status = statusLine(count: hits.count, query: q, remote: false)
+                            + " · 保留首屏结果"
+                    }
                     lastSearchTrace = trace.finish(hits: hits)
                 }
             }
-            // Treat a short pause as query commitment. This avoids sending every Pinyin
-            // composition update to Jev while still refining every settled query.
-            try? await Task.sleep(nanoseconds: 450_000_000)
-            let still = query.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !Task.isCancelled, token == rerankToken, still == q else { return }
-
-            var rankedLocal = local
-            var automaticNote = ""
-            if jevPrecisionReady, !local.isEmpty {
-                status = statusLine(count: local.count, query: q, remote: false) + " · Jev 正在整理…"
-                let judgeStarted = ProcessInfo.processInfo.systemUptime
-                let ranked = await automaticallyRank(query: q, candidates: local, files: snapshot)
-                if let outcome = ranked.outcome {
-                    trace.record("automatic_jev", startedAt: judgeStarted, candidates: outcome.requests)
-                }
+            if localOnly {
+                await Task.yield()
+                let deadline = ProcessInfo.processInfo.systemUptime + DeepScanSearchEnhancement.timeout
                 guard !Task.isCancelled, token == rerankToken,
-                      query.trimmingCharacters(in: .whitespacesAndNewlines) == q else { return }
-                rankedLocal = ranked.hits
-                hits = rankedLocal
-                automaticNote = automaticJevNote(ranked.outcome)
-                status = statusLine(count: hits.count, query: q, remote: false) + automaticNote
+                      request.matches(generation: searchGeneration, query: query) else { return }
+                let candidates: DeepScanSearchEnhancement.Candidates
+                do {
+                    candidates = try await ArchitectureAuditTrace.$traceID.withValue(trace.id.uuidString) {
+                        try await DeepScanSearchEnhancement.candidates(query: q, v1: local,
+                            semantic: wideSemantic, files: snapshot, roots: rootSnapshot)
+                    }
+                } catch { return }
+                trace.record("deepscan_retrieval", milliseconds: candidates.retrievalMilliseconds, candidates: candidates.hits.count)
+                trace.record("enhancement_fusion", milliseconds: candidates.fusionMilliseconds, candidates: candidates.hits.count)
+                guard !Task.isCancelled, token == rerankToken,
+                      request.matches(generation: searchGeneration, query: query),
+                      ProcessInfo.processInfo.systemUptime < deadline, !candidates.hits.isEmpty else { return }
+                let judgeStarted = ProcessInfo.processInfo.systemUptime
+                let ranked = await ArchitectureAuditTrace.$traceID.withValue(trace.id.uuidString) {
+                    await LocalBGERerank.rerank(query: q, hits: candidates.hits, files: snapshot,
+                        candidateLimit: DeepScanSearchEnhancement.topN, summaries: candidates.summaries,
+                        timeout: deadline - ProcessInfo.processInfo.systemUptime)
+                }
+                trace.record("automatic_bge", startedAt: judgeStarted, candidates: min(DeepScanSearchEnhancement.topN, candidates.hits.count))
+                guard let ranked, !Task.isCancelled, token == rerankToken,
+                      request.matches(generation: searchGeneration, query: query),
+                      ProcessInfo.processInfo.systemUptime < deadline else { return }
+                hits = Array(ranked.prefix(30))
+                enhancedPublished = true
                 if selected == nil || !hits.contains(where: { $0.id == selected }) {
                     selected = hits.first?.id
                 }
+                status = statusLine(count: hits.count, query: q, remote: false)
+                    + " · DeepScan + BGE 已整理"
+                ArchitectureAuditTrace.event("ui_publish_enhanced", id: trace.id.uuidString, count: hits.count)
+                return
             }
-
-            let semanticStarted = ProcessInfo.processInfo.systemUptime
-            let semantic = local.isEmpty
-                ? await LocalSemanticIndex.shared.search(query: q, roots: rootSnapshot)
-                : []
-            if local.isEmpty {
-                trace.record("semantic_retrieval", startedAt: semanticStarted, candidates: semantic.count)
-            }
+            let semantic = wideSemantic
+            trace.record("semantic_wide_reuse", milliseconds: 0, candidates: semantic.count)
             guard !Task.isCancelled, token == rerankToken, query.trimmingCharacters(in: .whitespacesAndNewlines) == q else { return }
-            let retrieved: [FileHit]
-            if semantic.isEmpty { retrieved = local }
-            else {
-                retrieved = await withCheckedContinuation { continuation in
-                    Self.searchQueue.async {
-                        continuation.resume(returning: LibraryGateway.searchCandidates(
-                            query: q, in: snapshot, semantic: semantic).map(\.hit))
+            searchProgress = 0.86
+            let rerankerAvailable = jevReady
+            let candidateQueue = ArchitectureAuditTrace.begin("rerank_candidate_queue_wait", id: trace.id.uuidString)
+            let candidateResume = ArchitectureAuditTrace.begin("rerank_candidate_roundtrip", id: trace.id.uuidString)
+            let (widened, resumeWait): ([FileHit], ArchitectureAuditTrace.Span?) = await withCheckedContinuation { continuation in
+                Self.searchQueue.async {
+                    candidateQueue?.end()
+                    ArchitectureAuditTrace.$traceID.withValue(trace.id.uuidString) {
+                        let build = ArchitectureAuditTrace.begin("rerank_candidate_build")
+                        let result = rerankerAvailable
+                            ? LibraryGateway.fallbackCandidates(
+                                query: q, in: snapshot, semantic: semantic,
+                                limit: JevRerank.candidateLimit)
+                            : LibraryGateway.search(
+                                query: q, in: snapshot, semantic: semantic,
+                                limit: JevRerank.candidateLimit)
+                        build?.end(count: result.count)
+                        continuation.resume(returning: (result, ArchitectureAuditTrace.begin("rerank_main_resume_wait")))
                     }
                 }
             }
+            resumeWait?.end(count: widened.count)
+            candidateResume?.end(count: widened.count)
             guard !Task.isCancelled, token == rerankToken, query.trimmingCharacters(in: .whitespacesAndNewlines) == q else { return }
-            let candidates: [FileHit]
-            if local.isEmpty {
-                candidates = retrieved
-            } else {
-                let localIDs = Set(local.map(\.id))
-                candidates = rankedLocal + retrieved.filter { !localIDs.contains($0.id) }
+            let merge = ArchitectureAuditTrace.begin("rerank_candidate_merge", id: trace.id.uuidString)
+            var seen = Set<String>()
+            let candidates = Array((rerankerAvailable ? local + widened : widened + local)
+                .filter { seen.insert($0.path).inserted }
+                .prefix(JevRerank.candidateLimit))
+            merge?.end(count: candidates.count)
+            guard !candidates.isEmpty else {
+                status = statusLine(count: local.count, query: q, remote: false)
+                return
             }
             hits = candidates
-            status = statusLine(count: hits.count, query: q, remote: false)
-            if selected == nil || !hits.contains(where: { $0.id == selected }) { selected = hits.first?.id }
-
-            if jevPrecisionReady, local.isEmpty, !candidates.isEmpty {
-                status = statusLine(count: hits.count, query: q, remote: false) + " · Jev 正在整理…"
-                let judgeStarted = ProcessInfo.processInfo.systemUptime
-                let ranked = await automaticallyRank(query: q, candidates: candidates, files: snapshot)
-                if let outcome = ranked.outcome {
-                    trace.record("automatic_jev", startedAt: judgeStarted, candidates: outcome.requests)
+            if selected == nil || !candidates.contains(where: { $0.id == selected }) {
+                selected = candidates.first?.id
+            }
+            status = statusLine(count: candidates.count, query: q, remote: false)
+                + (jevReady ? " · \(automaticRerankerName) 正在整理…" : "")
+            guard jevReady else { return }
+            searchProgress = 0.92
+            let judgeStarted = ProcessInfo.processInfo.systemUptime
+            let jevRanked = await ArchitectureAuditTrace.$traceID.withValue(trace.id.uuidString) {
+                await automaticallyRank(query: q, candidates: candidates, files: snapshot)
+            }
+            if jevRanked.usedBGE {
+                trace.record("automatic_bge", startedAt: judgeStarted, candidates: candidates.count)
+            } else if let outcome = jevRanked.outcome {
+                trace.record("automatic_jev", startedAt: judgeStarted, candidates: outcome.requests)
+            }
+            guard !Task.isCancelled, token == rerankToken,
+                  query.trimmingCharacters(in: .whitespacesAndNewlines) == q else { return }
+            if let outcome = jevRanked.outcome,
+               !jevRanked.usedBGE,
+               (outcome.requests == 0 || outcome.errors == outcome.requests) {
+                let safe = await withCheckedContinuation { continuation in
+                Self.searchQueue.async {
+                    ArchitectureAuditTrace.$traceID.withValue(trace.id.uuidString) {
+                        continuation.resume(returning: LibraryGateway.search(
+                            query: q, in: snapshot, semantic: semantic,
+                            limit: JevRerank.candidateLimit))
+                    }
+                }
                 }
                 guard !Task.isCancelled, token == rerankToken,
                       query.trimmingCharacters(in: .whitespacesAndNewlines) == q else { return }
-                hits = ranked.hits
-                if selected == nil || !hits.contains(where: { $0.id == selected }) {
-                    selected = hits.first?.id
-                }
-                automaticNote = automaticJevNote(ranked.outcome)
+                hits = safe
+            } else {
+                hits = jevRanked.hits
             }
-            status = statusLine(count: hits.count, query: q, remote: false) + automaticNote
-            reranking = false
+            if selected == nil || !hits.contains(where: { $0.id == selected }) {
+                selected = hits.first?.id
+            }
+            status = statusLine(count: hits.count, query: q, remote: false)
+                + automaticRerankerNote(jevRanked.outcome, usedBGE: jevRanked.usedBGE)
+            ArchitectureAuditTrace.event("ui_publish_rerank", id: trace.id.uuidString, count: hits.count)
             let cloudCandidates = hits
             guard remoteReady, APIConfiguration.cloudRerankEnabled, !cloudCandidates.isEmpty else { return }
             reranking = true
@@ -806,19 +1011,33 @@ final class SearchModel: ObservableObject {
 
     @MainActor private func automaticallyRank(
         query: String, candidates: [FileHit], files: [IndexedFile]
-    ) async -> (hits: [FileHit], outcome: JevRerank.Outcome?) {
+    ) async -> (hits: [FileHit], outcome: JevRerank.Outcome?, usedBGE: Bool) {
         let signature = Self.automaticJevSignature(query: query, hits: candidates)
         if automaticJevSignature == signature {
-            return (automaticJevHits, nil)
+            ArchitectureAuditTrace.event("rerank_cache_hit", count: candidates.count)
+            return (automaticJevHits, nil, automaticRerankerWasBGE)
         }
+        if let ranked = await LocalBGERerank.rerank(query: query, hits: candidates, files: files) {
+            automaticJevSignature = signature
+            automaticJevHits = ranked
+            automaticRerankerWasBGE = true
+            return (ranked, nil, true)
+        }
+        // A local test build never falls back to an external reranker implicitly.
+        if AIEApplicationPaths.isCleanV2 { return (candidates, nil, false) }
         let outcome = await JevRerank.rerank(
             query: query, hits: candidates, files: files, dropSeriouslyIrrelevant: true)
-        automaticJevSignature = signature
-        automaticJevHits = outcome.hits
-        return (outcome.hits, outcome)
+        if outcome.requests > 0 && outcome.errors < outcome.requests {
+            automaticJevSignature = signature
+            automaticJevHits = outcome.hits
+            automaticRerankerWasBGE = false
+        }
+        return (outcome.hits, outcome, false)
     }
 
-    private func automaticJevNote(_ outcome: JevRerank.Outcome?) -> String {
+    private func automaticRerankerNote(_ outcome: JevRerank.Outcome?, usedBGE: Bool) -> String {
+        if usedBGE { return " · BGE 已整理" }
+        if AIEApplicationPaths.isCleanV2 { return " · 保留原排序（BGE 未完成）" }
         guard let outcome else { return " · Jev 已整理" }
         if outcome.requests == 0 {
             return " · " + (JevRerank.lastError ?? "Jev 没有返回判断")
@@ -831,10 +1050,10 @@ final class SearchModel: ObservableObject {
 
     private func statusLine(count: Int, query: String, remote: Bool, done: Bool = false) -> String {
         let base: String
-        if count == 0, ScanProgress.shared.running {
+        if count == 0, ScanProgress.shared.running || ScanProgress.shared.indexing {
             base = "暂未找到 · 部分内容仍在分析"
         } else {
-            base = count == 0 ? "没有找到相关内容" : "找到 \(count) 个"
+            base = count == 0 ? "没有找到相关内容" : "显示前 \(count) 个结果"
         }
         if remote { return base + " · 正在重排…" }
         if done { return base + " · 已重排" }
@@ -977,6 +1196,7 @@ final class SearchModel: ObservableObject {
     }
 
     func previewSelected() {
+        ScanControl.shared.noteInteractiveWork(settleAfter: 5)
         guard let path = previewPath() else { return }
         let hit = hits.first(where: { $0.id == selected })
         if URL(fileURLWithPath: path).pathExtension.lowercased() == "pdf"
@@ -1370,9 +1590,13 @@ final class SearchModel: ObservableObject {
 struct SearchPanelView: View {
     @ObservedObject var model: SearchModel
     @ObservedObject private var semantic = SemanticProgress.shared
+    @StateObject private var indexingProgress = APISettingsView.sharedProgress
     var onDismiss: () -> Void
     @State private var showRoots = false
     @State private var showSettings = false
+    private var progressRoots: [String] {
+        model.roots.map { $0.standardizedFileURL.resolvingSymlinksInPath().path }.sorted()
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1399,6 +1623,18 @@ struct SearchPanelView: View {
                         if model.handleReturn() { onDismiss() }
                     }
                     .frame(height: 26)
+                    Button {
+                        let panel = NSOpenPanel()
+                        panel.canChooseDirectories = false
+                        panel.allowedContentTypes = [.image]
+                        if panel.runModal() == .OK, let url = panel.url { model.beginImageSearch(url) }
+                    } label: {
+                        Image(systemName: "photo.on.rectangle")
+                            .font(.system(size: 14, weight: .medium))
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("以图片搜索")
                 }
                 RecycleHeaderButton(model: model)
                 Button {
@@ -1428,7 +1664,7 @@ struct SearchPanelView: View {
                 .accessibilityLabel("设置")
                 .help("设置 · 查看本机扫描进度与配置云端功能")
                 .popover(isPresented: $showSettings, arrowEdge: .bottom) {
-                    APISettingsView(model: model)
+                    APISettingsView(model: model, progress: indexingProgress, observesProgress: false)
                         .frame(height: 480)
                         .onExitCommand { showSettings = false }
                 }
@@ -1514,25 +1750,31 @@ struct SearchPanelView: View {
                         .disabled(model.junkPicked.isEmpty || model.recycleBusy)
                     }
                 } else {
-                    if model.searchInProgress {
-                        ProgressView()
-                            .controlSize(.small)
-                    }
-                    Text(model.searchInProgress ? model.status : (model.tabSuggestionStatus ?? model.status))
-                        .foregroundStyle(.tertiary)
-                        .lineLimit(1)
-                    Spacer()
-                    PrecisionSearchButton(model: model)
-                    Button {
-                        showRoots = true
-                    } label: {
-                        HStack(spacing: 4) {
-                            Image(systemName: "folder")
-                            Text(model.rootsLabel)
+                    VStack(spacing: 5) {
+                        HStack(spacing: 8) {
+                            Text(model.hasActiveQuery
+                                 ? model.status
+                                 : (model.tabSuggestionStatus ?? model.status))
+                                .foregroundStyle(.tertiary)
+                                .lineLimit(1)
+                            Spacer()
+                            Button {
+                                showRoots = true
+                            } label: {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "folder")
+                                    Text(model.rootsLabel)
+                                }
+                                .foregroundStyle(.tertiary)
+                            }
+                            .buttonStyle(.plain)
                         }
-                        .foregroundStyle(.tertiary)
+                        if let progress = model.searchProgress {
+                            ProgressView(value: progress)
+                                .progressViewStyle(.linear)
+                                .controlSize(.mini)
+                        }
                     }
-                    .buttonStyle(.plain)
                 }
             }
             .font(.system(size: 13))
@@ -1541,6 +1783,10 @@ struct SearchPanelView: View {
         }
         .onReceive(semantic.$revision.dropFirst()) { _ in
             if !model.query.isEmpty { model.refreshAfterIndexUpdate() }
+        }
+        .task(id: progressRoots.joined(separator: "\n")) {
+            guard !model.isPreview else { return }
+            await indexingProgress.observe(roots: progressRoots, id: progressRoots.joined(separator: "\n"))
         }
         .frame(width: 620, height: 480)
         .background(.ultraThinMaterial)
@@ -1599,39 +1845,13 @@ private struct SearchResultsList: View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(spacing: 2) {
-                    if model.hasActiveQuery {
-                        if !model.possibleHits.isEmpty {
-                            HStack(spacing: 8) {
-                                tierCount("直接命中", count: model.directHits.count, emphasized: true) {
-                                    withAnimation(.easeOut(duration: 0.16)) {
-                                        proxy.scrollTo("direct-results", anchor: .top)
-                                    }
-                                }
-                                tierCount("你可能还在找", count: model.possibleHits.count, emphasized: false) {
-                                    withAnimation(.easeOut(duration: 0.16)) {
-                                        proxy.scrollTo("possible-results", anchor: .top)
-                                    }
-                                }
-                                Spacer()
-                            }
-                            .padding(.horizontal, 6)
-                            .padding(.bottom, 4)
-                        }
-                        if model.directHits.isEmpty {
-                            deepSearchPrompt
-                        } else {
-                            header("直接命中", detail: "有明确的文件名、原文、OCR 或编号证据")
-                                .id("direct-results")
-                            rows(model.directHits)
-                        }
-                        if !model.possibleHits.isEmpty {
-                            header("你可能还在找", detail: "语义相关，但证据还不够确定")
-                                .id("possible-results")
-                                .padding(.top, model.directHits.isEmpty ? 0 : 8)
-                            rows(model.possibleHits)
-                        }
-                    } else {
-                        rows(model.hits)
+                    rows(model.hits)
+                    if model.canExpandSearch {
+                        Button("查看更多候选") { model.expandSearchResults() }
+                            .buttonStyle(.plain)
+                            .foregroundStyle(.secondary)
+                            .padding(.vertical, 10)
+                            .disabled(model.searchInProgress)
                     }
                 }
                 .padding(.horizontal, 8)
@@ -1644,70 +1864,14 @@ private struct SearchResultsList: View {
         }
     }
 
-    private func tierCount(_ title: String, count: Int, emphasized: Bool,
-                           action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            HStack(spacing: 4) {
-                Text(title)
-                Text("\(count)").monospacedDigit()
-                Image(systemName: "chevron.down")
-                    .font(.system(size: 8, weight: .semibold))
-            }
-            .font(.system(size: 10.5, weight: emphasized ? .semibold : .medium))
-            .foregroundStyle(emphasized ? Color.secondary : Color.accentColor)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-            .background(
-                Capsule(style: .continuous)
-                    .fill(Color.primary.opacity(emphasized ? 0.035 : 0.055))
-            )
-        }
-        .buttonStyle(.plain)
-    }
-
-    private func header(_ title: String, detail: String) -> some View {
-        HStack(alignment: .firstTextBaseline) {
-            Text(title).font(.system(size: 12, weight: .semibold))
-            Text(detail).font(.system(size: 10)).foregroundStyle(.tertiary)
-            Spacer()
-        }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 5)
-        .accessibilityElement(children: .combine)
-    }
-
-    private var deepSearchPrompt: some View {
-        HStack(spacing: 10) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text("没有足够确定的直接命中")
-                    .font(.system(size: 12, weight: .medium))
-                Text("扩大召回范围，再让 Jev 判断更多候选")
-                    .font(.system(size: 10.5))
-                    .foregroundStyle(.tertiary)
-            }
-            Spacer()
-            Button(model.precisionSearching ? "精搜中" : "开始精搜") {
-                model.startPrecisionSearch()
-            }
-            .buttonStyle(.plain)
-            .font(.system(size: 11.5, weight: .semibold))
-            .foregroundStyle(Color.accentColor)
-            .disabled(model.precisionSearching || model.deepSearching)
-        }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 8)
-        .background(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .fill(Color.primary.opacity(0.035))
-        )
-    }
-
     @ViewBuilder private func rows(_ hits: [FileHit]) -> some View {
         ForEach(hits) { hit in
-            HitRow(hit: hit, selected: model.selected == hit.id, onPlay: {
+            HitRow(hit: hit, fallbackSummary: model.files.first { $0.path == hit.path }?.browseSummary ?? "",
+                   selected: model.selected == hit.id, onPlay: {
                 model.selected = hit.id
                 model.previewSelected()
             })
+                .onAppear { model.auditResultAppeared(hit.path) }
                 .id(hit.id)
                 .onTapGesture(count: 2) {
                     model.selected = hit.id
@@ -1761,35 +1925,6 @@ private struct RecycleActionButton: View {
         }
         .buttonStyle(.plain)
         .foregroundStyle(isEnabled ? Color.primary : Color.secondary.opacity(0.5))
-    }
-}
-
-private struct PrecisionSearchButton: View {
-    @ObservedObject var model: SearchModel
-
-    private var visible: Bool {
-        !model.recycleMode && !model.query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-    }
-
-    private var enabled: Bool {
-        model.jevPrecisionReady && !model.precisionSearching && !model.deepSearching
-    }
-
-    var body: some View {
-        if visible {
-            Button {
-                model.startPrecisionSearch()
-            } label: {
-                Label(model.precisionSearching ? "精搜中" : "精搜", systemImage: "sparkles")
-                    .labelStyle(.titleAndIcon)
-                    .font(.system(size: 13, weight: .medium))
-                    .fixedSize()
-                    .foregroundStyle(enabled ? Color.primary.opacity(0.72) : Color.secondary.opacity(0.45))
-            }
-            .buttonStyle(.plain)
-            .disabled(!enabled)
-            .help(model.jevPrecisionReady ? "扩大召回范围并用 Jev 精排" : "未配置 OpenRouter API Key")
-        }
     }
 }
 
@@ -2010,7 +2145,7 @@ private struct ReusePanel: View {
                 .multilineTextAlignment(.center)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .padding(24)
+        .padding(model.fastSearching ? 8 : 24)
     }
 
     private func chooseView(_ proposal: ReuseProposal) -> some View {
@@ -2726,43 +2861,65 @@ private struct EmptyHitsView: View {
                     .font(.system(size: 13))
                     .foregroundStyle(.tertiary)
             } else if model.fastSearching {
-                ProgressView("正在搜索…")
-                    .controlSize(.small)
-            } else if model.precisionSearching {
-                Text("正在用 Jev 精搜…")
-                    .font(.system(size: 13))
-                    .foregroundStyle(.secondary)
-            } else if model.deepSearching {
-                Text("快速检索没找到，正在用 Jev 核对放宽候选…")
-                    .font(.system(size: 13))
-                    .foregroundStyle(.secondary)
+                SemanticSearchLoadingView()
             } else if model.reranking {
-                Text("正在检索，Jev 会自动整理结果…")
+                Text(model.jevReady ? "正在补充可能结果，精排器会自动整理…" : "正在补充可能结果…")
                     .font(.system(size: 13))
                     .foregroundStyle(.secondary)
-            } else if model.jevPrecisionReady {
-                Text("快速检索没有找到确定结果")
-                    .font(.system(size: 13))
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
-                Button("开始精搜") { model.startPrecisionSearch() }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
             } else if GroqRerank.shouldRun(query: model.query), !model.remoteReady {
                 Text("没有找到相关文件。可换一个关键词，或在设置中安装本机模型。")
                     .font(.system(size: 13))
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
             } else {
-                Text("没有找到相关文件")
-                    .font(.system(size: 13))
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 22, weight: .light))
                     .foregroundStyle(.tertiary)
+                Text("没有可靠结果")
+                    .font(.system(size: 14, weight: .medium))
+                Text(model.status)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.tertiary)
+                    .multilineTextAlignment(.center)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding(24)
     }
 
+}
+
+private struct SemanticSearchLoadingView: View {
+    var body: some View {
+        VStack(spacing: 0) {
+            ForEach(0..<3, id: \.self) { index in
+                HStack(spacing: 12) {
+                    VStack(alignment: .leading, spacing: 7) {
+                        RoundedRectangle(cornerRadius: 3)
+                            .fill(Color.primary.opacity(0.09))
+                            .frame(width: index == 1 ? 140 : 180, height: 11)
+                        RoundedRectangle(cornerRadius: 3)
+                            .fill(Color.primary.opacity(0.05))
+                            .frame(width: index == 2 ? 310 : 390, height: 9)
+                        RoundedRectangle(cornerRadius: 3)
+                            .fill(Color.primary.opacity(0.035))
+                            .frame(width: index == 0 ? 250 : 210, height: 8)
+                    }
+                    Spacer()
+                    RoundedRectangle(cornerRadius: 7)
+                        .fill(Color.primary.opacity(0.045))
+                        .frame(width: 54, height: 42)
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 11)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                if index < 2 {
+                    Divider().padding(.leading, 10)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
 }
 
 private struct EmptyRootsView: View {
@@ -2904,8 +3061,21 @@ private struct FileNameLine: View {
 
 private struct HitRow: View {
     let hit: FileHit
+    let fallbackSummary: String
     let selected: Bool
     let onPlay: () -> Void
+
+    private var displaySnippet: String {
+        let snippet = hit.snippet.trimmingCharacters(in: .whitespacesAndNewlines)
+        let content = (snippet.range(of: " · ").map { String(snippet[$0.upperBound...]) } ?? snippet)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if !content.isEmpty && !snippet.hasPrefix("文件信息 · ")
+            && content != hit.name && content != hit.path && content != hit.relative {
+            return hit.snippet
+        }
+        if !fallbackSummary.isEmpty { return "文件摘要 · " + String(fallbackSummary.prefix(90)) }
+        return "文件信息 · " + hit.name
+    }
 
     var body: some View {
         HStack(alignment: .center, spacing: 14) {
@@ -2929,8 +3099,8 @@ private struct HitRow: View {
                         .accessibilityLabel("从 \(MediaOpenPolicy.clock(start)) 播放 \(hit.name)")
                     }
                 }
-                if !hit.snippet.isEmpty {
-                    Text(highlightedSnippet(hit.snippet, terms: hit.highlights, size: 12, weight: .regular, base: .secondary))
+                if !displaySnippet.isEmpty {
+                    Text(highlightedSnippet(displaySnippet, terms: hit.highlights, size: 12, weight: .regular, base: .secondary))
                         .lineLimit(2)
                 }
                 Text(hit.relative)

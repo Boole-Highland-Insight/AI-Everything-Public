@@ -14,6 +14,9 @@ let temporary = FileManager.default.temporaryDirectory.appendingPathComponent("a
 try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)
 defer { try? FileManager.default.removeItem(at: temporary) }
 try scanStatusChecks(in: temporary)
+try rawTextEmbeddingChecks(in: temporary)
+try gemmaFeatureChecks(in: temporary)
+try cleanSearchLifecycleChecks(in: temporary)
 let root = temporary.appendingPathComponent("library").path
 let otherRoot = temporary.appendingPathComponent("other").path
 let databasePath = temporary.appendingPathComponent("db/content.sqlite").path
@@ -45,6 +48,11 @@ let cascadeIndexes = try sqlite(databasePath, """
     );
     """).trimmingCharacters(in: .whitespacesAndNewlines)
 try check(cascadeIndexes == "3", "Cascade lookup indexes are missing")
+let featureSubjectIndex = try sqlite(databasePath, """
+    SELECT count(*) FROM sqlite_master
+    WHERE type='index' AND name='features_subject_lookup';
+    """)
+try check(featureSubjectIndex == "1", "Feature cleanup lookup index is missing")
 try db.synchronize(documents: [source], rootPaths: [root])
 try check(try db.statistics().chunks == stats.chunks && db.statistics().versions == 1, "Import is not idempotent")
 
@@ -187,8 +195,9 @@ let frameOCRHits = try db.search(allTerms: [["站台"]], rootPaths: [root])
 try check(frameOCRHits.contains { $0.kind == "frame_ocr" && $0.startSeconds == 5 },
           "Frame OCR lost its sampled time")
 let frameModelHits = try db.search(allTerms: [["黄色汽车"]], rootPaths: [root])
-try check(frameModelHits.contains { $0.kind == "video_segment_analysis" && $0.startSeconds == 5 },
-          "Video segment description lost its sampled time")
+try check(frameModelHits.isEmpty &&
+          db.chunks(rootPaths: [root]).contains { $0.kind == "video_segment_analysis" && $0.startSeconds == 5 },
+          "Historical video description must be retained but excluded from V1 FTS")
 try check(try db.search(allTerms: [["不可检索失败文本"]], rootPaths: [root]).isEmpty, "Failed transcript was indexed")
 audioSource.contentHash = "audio-v2"
 audioSource.blocks = [ContentBlock(key: "document", parentKey: nil, kind: "document", text: "lecture.mp4")]
@@ -209,8 +218,16 @@ semanticDoc.fileSummary = "旧摘要"
 try hybridDB.synchronize(documents: [semanticDoc], rootPaths: [root])
 let embeddingInputs = try hybridDB.missingEmbeddings(spaceID: "test-space", rootPaths: [root])
 let rootInput = embeddingInputs.first { $0.kind == "document" }!
+let summaryInputs = try hybridDB.missingEmbeddings(
+    spaceID: "summary-space", rootPaths: [root], semanticMethods: ["file_summary"]
+)
+try check(summaryInputs.count == 1 && summaryInputs[0].id == rootInput.id,
+          "Summary-only embedding selection included source text")
 try hybridDB.putEmbedding(chunkID: rootInput.id, spaceID: "test-space", modelID: "fixture", modelVersion: "1", vector: [1,0], rootPaths: [root], expectedContentHash: rootInput.contentHash)
 try check(try hybridDB.embeddingCoverage(spaceID: "test-space", rootPaths: [root]).ready == 1, "Embedding coverage incorrect")
+try check(try hybridDB.embeddingCoverage(
+    spaceID: "summary-space", rootPaths: [root], semanticMethods: ["file_summary"]
+).total == 1, "Summary-only embedding coverage included source text")
 try check(try hybridDB.understandingStatistics().features == 2,
           "Embedding was not mirrored into the feature store")
 semanticDoc.fileSummary = "新的摘要包含不同语义"
@@ -302,6 +319,7 @@ try check(budgetCapacity.semanticUsage.first(where: { $0.contentClass == .image 
           budgetCapacity.semanticUsage.reduce(Int64.zero, { $0 + $1.targetBytes }) == 100,
           "Per-content semantic usage accounting is incorrect")
 print("Semantic budget checks passed: vector-only limit, per-class accounting and fair first coverage.")
+try semanticSchedulingChecks(in: temporary)
 
 let projectionDB = try ContentStore(path: temporary.appendingPathComponent("projection.sqlite").path)
 let filenameDoc = SourceDocument(id: "name-hit", rootPath: root, path: root + "/专项技术.pptx", relativePath: "专项技术.pptx",

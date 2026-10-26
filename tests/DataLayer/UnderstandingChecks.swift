@@ -50,8 +50,9 @@ func understandingChecks(_ directory: URL) throws {
     try check(stats.features == 2, "Version hash features were not persisted")
     try check(stats.relations == 1, "Exact duplicate relation was not created")
     try check(stats.unitContents < stats.contentUnits, "Model/system observations leaked into factual unit contents")
-    try check(try db.search(allTerms: [["北极星团队"]], rootPaths: [root]).first?.fileID == image.id,
-              "Entity observation did not reach the search projection")
+    try check(try db.search(allTerms: [["北极星团队"]], rootPaths: [root]).isEmpty &&
+              db.entityNames(rootPaths: [root])[image.path]?.contains("北极星团队") == true,
+              "Historical entity must remain stored but stay outside V1 FTS")
     try check(try db.search(allTerms: [["884209"]], rootPaths: [root]).count == 2,
               "OCR facts did not reach the search projection")
 

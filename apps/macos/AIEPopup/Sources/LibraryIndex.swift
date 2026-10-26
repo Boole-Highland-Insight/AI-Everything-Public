@@ -71,6 +71,7 @@ struct IndexedFile {
     var summaryIssue: String? = nil
     var contentIssue: String? = nil
     var fileSummary = ""
+    var browseSummary = ""
     var lastOpenedAt: Date? = nil
     var entityNames: [String] = []
     var contentType = ""
@@ -448,7 +449,7 @@ enum LibraryIndex {
     }
 
     static func recentSnippet(_ file: IndexedFile) -> String {
-        if !file.fileSummary.isEmpty { return "文件摘要 · " + clip(file.fileSummary, max: 72) }
+        if !file.browseSummary.isEmpty { return "文件摘要 · " + clip(file.browseSummary, max: 72) }
         if let body = file.chunks.first(where: { $0.kind != "document" && !$0.text.isEmpty }) { return "原文 · " + clip(body.text, max: 72) }
         return "文件信息 · " + file.name
     }
@@ -625,8 +626,12 @@ enum LibraryIndex {
             kinds = [.document]
         }
 
-        if let match = trimmed.range(of: #"\.[A-Za-z0-9]{1,5}"#, options: .regularExpression) {
-            ext = String(trimmed[match]).dropFirst().lowercased()
+        if let match = trimmed.range(of: #"\.[A-Za-z][A-Za-z0-9]{0,4}\b"#, options: .regularExpression) {
+            let candidate = String(trimmed[match]).dropFirst().lowercased()
+            if ["pdf", "doc", "docx", "ppt", "pptx", "txt", "md", "rtf", "pages", "png", "jpg", "jpeg",
+                "webp", "heic", "mp4", "mov", "m4v", "csv", "tsv", "xls", "xlsx"].contains(candidate) {
+                ext = candidate
+            }
         }
 
         rest = rest.replacingOccurrences(

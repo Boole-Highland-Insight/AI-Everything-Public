@@ -12,8 +12,7 @@ import AIEData
     private var window: NSWindow?
     private var completion: ((URL) -> Void)?
     nonisolated static var directory: URL {
-        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("AI Everything/Photo Imports", isDirectory: true)
+        AIEApplicationPaths.support.appendingPathComponent("Photo Imports", isDirectory: true)
     }
     nonisolated static func contains(_ path: String) -> Bool {
         path.hasPrefix(directory.path + "/")

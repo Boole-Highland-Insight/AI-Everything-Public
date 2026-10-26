@@ -59,10 +59,9 @@ enum QuickScanner {
         done: @escaping () -> Void
     ) {
         guard LibraryGateway.lastError == nil else { DispatchQueue.main.async(execute: done); return }
-        guard ScanConfiguration.visionEnabled() else {
+        guard ScanConfiguration.backgroundUnderstandingCanRun() else {
             DispatchQueue.main.async {
-                ScanProgress.shared.finish(wrote: 0)
-                ScanProgress.shared.message = "基础分析已就绪 · 模型任务未启用"
+                ScanProgress.shared.pauseDeepUnderstanding()
                 done()
             }
             return
@@ -101,6 +100,7 @@ enum QuickScanner {
         }
         let supported = files.filter {
             supports($0.ext) && !ScanPolicy.isDeferred($0) && (!PhotoImport.contains($0.path) || hasLocalModel)
+                && !isDeepUnderstandingSkipped($0)
         }
         let skipped = files.count - supported.count
         let fresh = supported.filter {
@@ -169,7 +169,7 @@ enum QuickScanner {
                 DispatchQueue.main.async { ScanProgress.shared.setYieldingForSearch(false) }
             }
             lock.lock()
-            if ScanControl.shared.isPaused || !ScanConfiguration.visionEnabled() {
+            if ScanControl.shared.isPaused || !ScanConfiguration.backgroundUnderstandingCanRun() {
                 let paused = ScanControl.shared.isPaused
                 lock.unlock()
                 let released = DispatchSemaphore(value: 0)
@@ -180,7 +180,7 @@ enum QuickScanner {
                 lock.unlock()
                 DispatchQueue.main.async {
                     if paused { ScanProgress.shared.pauseByUser() }
-                    else { ScanProgress.shared.finish(wrote: 0) }
+                    else { ScanProgress.shared.pauseDeepUnderstanding() }
                 }
                 return
             }
@@ -216,6 +216,11 @@ enum QuickScanner {
             lock.unlock()
             guard LibraryGateway.allowsScanning(file) else {
                 lock.lock(); pendingPaths.remove(file.path); lock.unlock()
+                continue
+            }
+            if isDeepUnderstandingSkipped(file) {
+                lock.lock(); pendingPaths.remove(file.path); lock.unlock()
+                DispatchQueue.main.async { ScanProgress.shared.completeLLMOne(file: file.relative) }
                 continue
             }
 
@@ -269,6 +274,15 @@ enum QuickScanner {
                 durableJob = nil
             }
 
+            if isDeepUnderstandingSkipped(file) {
+                if let durableJob {
+                    _ = try? AppDatabase.open().releaseJob(id: durableJob.id, owner: workerID)
+                }
+                lock.lock(); pendingPaths.remove(file.path); lock.unlock()
+                DispatchQueue.main.async { ScanProgress.shared.completeLLMOne(file: file.relative) }
+                continue
+            }
+
             DispatchQueue.main.async {
                 let p = ScanProgress.shared
                 p.currentFile = file.relative
@@ -299,7 +313,7 @@ enum QuickScanner {
                 )
             }
             if !ok, LocalQuickScan.isInstalled,
-               ScanControl.shared.interactiveRevision != interactionRevision {
+               (ScanControl.shared.interactiveRevision != interactionRevision || !ScanConfiguration.backgroundUnderstandingCanRun()) {
                 if let durableJob {
                     _ = try? AppDatabase.open().releaseJob(
                         id: durableJob.id, owner: workerID,
@@ -367,16 +381,27 @@ enum QuickScanner {
 
     private static func scheduleRetry(_ file: IndexedFile, after delay: TimeInterval) {
         workQueue.asyncAfter(deadline: .now() + max(1, delay)) {
+            guard !isDeepUnderstandingSkipped(file) else { return }
             lock.lock()
             if !pendingPaths.contains(file.path) {
                 pending.append(file)
                 pendingPaths.insert(file.path)
                 pending.sort(by: ScanOrder.precedes)
             }
-            let shouldStart = !running && !pending.isEmpty
+            let shouldStart = !running && !pending.isEmpty && ScanConfiguration.backgroundUnderstandingCanRun() && !ScanControl.shared.isPaused
             if shouldStart { running = true }
             lock.unlock()
             if shouldStart { drain() }
+        }
+    }
+
+    private static func isDeepUnderstandingSkipped(_ file: IndexedFile) -> Bool {
+        guard LocalQuickScan.isInstalled, let versionID = file.versionID else { return false }
+        do {
+            return try AppDatabase.open().isDeepUnderstandingSkipped(path: file.path, versionID: versionID)
+        } catch {
+            AppLog.write("quickscan skip check: \(error)")
+            return true
         }
     }
 
@@ -416,6 +441,8 @@ enum QuickScanner {
 
     @discardableResult
     private static func scanOne(_ file: IndexedFile) -> Bool {
+        let audit = ArchitectureAuditTrace.begin("quickscan_file")
+        defer { audit?.end() }
         if PhotoImport.contains(file.path), !LocalQuickScan.isInstalled {
             failureReason = "照片图库副本仅允许本地扫描，请安装本地模型"
             return false
@@ -520,6 +547,14 @@ enum QuickScanner {
         }
         if saved, let savedScan { deepScanCache[sourceHash] = savedScan }
         return saved
+    }
+
+    /// Diagnostic entry only: existing scanners, isolated database, no cloud fallback.
+    static func auditScan(_ file: IndexedFile) -> Bool {
+        guard ArchitectureAuditTrace.enabled,
+              ProcessInfo.processInfo.environment["AIE_DATABASE_PATH"]?.hasPrefix("/tmp/") == true,
+              LocalQuickScan.isInstalled else { return false }
+        return scanOne(file)
     }
 
     private static func describeText(file: IndexedFile, url: URL) -> ScanResult? {

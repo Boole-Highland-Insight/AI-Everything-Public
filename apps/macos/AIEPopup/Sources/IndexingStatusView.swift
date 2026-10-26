@@ -77,9 +77,14 @@ struct IndexingStatusView: View {
     @ObservedObject var model: SearchModel
     @ObservedObject private var scan = ScanProgress.shared
     @ObservedObject private var semantic = SemanticProgress.shared
-    @State private var records: [FileScanStatus] = []
-    @State private var loaded = false
-    @State private var loadError = false
+    @StateObject private var progress = IndexingProgressDisplay()
+    private var records: [FileScanStatus] { progress.snapshot?.files ?? [] }
+    private var loaded: Bool { progress.matches(progressRequest) }
+    private var semanticLoaded: Bool { progress.semanticMatches(progressRequest) }
+    private var loadError: Bool { progress.failed }
+    private var progressRequest: String { roots.joined(separator: "\n") }
+    private var discovered: Int { roots.isEmpty ? 0 : max(scan.catalogCount, model.files.count) }
+    private var parsingPending: Bool { !loaded || scan.catalogDiscovering || scan.indexing || !scan.catalogReady || scan.indexFailed || !progress.count("index", discovered: discovered).settled }
     @State private var showIssues = false
     @State private var showFolders = false
     @State private var resourcePause: String?
@@ -106,7 +111,7 @@ struct IndexingStatusView: View {
                 guard skipped || failed else { return nil }
                 return ScanIssueDisplay(
                     id: file.path + ":" + stage, path: file.path, name: file.relativePath,
-                    stage: stage == "local" ? "文字识别" : "深度理解", skipped: skipped,
+                    stage: stage == "local" ? "内容识别" : "深度理解", skipped: skipped,
                     reason: file.deferred ? "已按你的设置暂缓分析"
                         : (skipped ? ScanSkipItem.reason(for: file.ext, cloud: stage == "quick")
                            : (result?.error ?? "未能完成分析，可重试"))
@@ -125,7 +130,7 @@ struct IndexingStatusView: View {
         if !loaded { return "正在读取索引状态" }
         if scan.yieldingForSearch { return "优先响应搜索" }
         if resourcePause != nil && busy { return "等待设备空闲" }
-        if busy { return "搜索已可用，分析继续中" }
+        if busy || parsingPending || !progress.count("local", discovered: discovered).settled || (ScanConfiguration.semanticEnabled() && (!semanticLoaded || !progress.semanticCount.settled)) { return "已有内容可搜索，索引持续更新中" }
         if failedCount > 0 { return "搜索已就绪，有文件待处理" }
         return records.isEmpty ? "资料夹中暂无文件" : "搜索已就绪"
     }
@@ -137,7 +142,7 @@ struct IndexingStatusView: View {
         if scan.yieldingForSearch { return "后台分析稍后自动继续，已完成的结果会保留。" }
         if let reason = resourcePause, busy { return reason + "，恢复后自动继续。" }
         if !loaded { return "正在恢复这次所选资料夹的进度。" }
-        return "\(records.count.formatted()) 个文件 · \(roots.count) 个资料夹 · 最近文件优先"
+        return "已发现 \(discovered.formatted()) 个文件 · 已完成基础索引 \(progress.count("index", discovered: discovered).ready.formatted()) 个"
     }
 
     var body: some View {
@@ -225,101 +230,57 @@ struct IndexingStatusView: View {
             .padding(20)
             .frame(width: 600, height: 420)
         }
-        .task(id: roots) {
-            let requested = roots
-            records = []; loaded = false; loadError = false
-            guard !requested.isEmpty else { loaded = true; return }
-            while !Task.isCancelled {
-                let result = await Task.detached(priority: .utility) {
-                    Result { try AppDatabase.open().scanStatus(rootPaths: requested) }
-                }.value
-                guard !Task.isCancelled, requested == roots else { return }
-                switch result {
-                case .success(let files): records = files; loaded = true; loadError = false
-                case .failure: loadError = true
-                }
-                resourcePause = BackgroundResourcePolicy.pauseReason
-                if !busy { retrying = false }
-                do { try await Task.sleep(nanoseconds: 3_000_000_000) } catch { return }
-            }
+        .task(id: progressRequest) { await progress.observe(roots: roots, id: progressRequest) }
+        .onReceive(progress.$snapshot) { _ in
+            resourcePause = BackgroundResourcePolicy.pauseReason
+            if !busy { retrying = false }
         }
     }
 
     private var stages: [IndexingStageDisplay] {
-        var index = fileStage("index", title: "文件索引", symbol: "doc.text.magnifyingglass", active: scan.indexing)
+        var index = fileStage("index", title: "文件解析", symbol: "doc.text.magnifyingglass", active: scan.indexing)
         if scan.indexing {
-            index = IndexingStageDisplay(id: "index", title: "文件索引", symbol: "doc.text.magnifyingglass",
-                detail: "正在整理文件名和正文，已完成部分可先搜索", status: "\(scan.indexedFiles) / \(scan.indexTotal)",
-                fraction: scan.indexTotal > 0 ? scan.indexFraction : nil, active: true)
+            index = IndexingStageDisplay(id: "index", title: "文件解析", symbol: "doc.text.magnifyingglass",
+                detail: "正在整理文件名和正文，已完成部分可先搜索", status: loaded ? "\(progress.count("index", discovered: discovered).ready) / \(discovered)" : "统计中",
+                fraction: loaded && discovered > 0 ? progress.count("index", discovered: discovered).fraction : nil, active: true)
         }
         return [index,
-            fileStage("local", title: "文字识别", symbol: "viewfinder", active: scan.running && scan.active == .local),
+            fileStage("local", title: "内容识别", symbol: "viewfinder", active: scan.running && scan.active == .local),
             semanticStage,
             fileStage(deepStage, title: "深度理解", symbol: "sparkles", active: scan.running && scan.active == .llm,
                       enabled: deepEnabled)]
     }
 
     private func fileStage(_ stage: String, title: String, symbol: String, active: Bool, enabled: Bool = true) -> IndexingStageDisplay {
-        let files = records.filter { stage == "index" || (!$0.deferred && $0.stages[stage]?.status != "unsupported") }
-        let completed = files.filter { ["ready", "usable", "available"].contains($0.stages[stage]?.status ?? "") }.count
-        let failed = files.filter { ["failed", "empty", "limited", "needs_review"].contains($0.stages[stage]?.status ?? "") }.count
-        let pending = files.filter { !["ready", "usable", "available", "failed", "empty", "limited", "needs_review"].contains($0.stages[stage]?.status ?? "") }
-        let remaining = pending.count
-        var detail = ""
-        var status = "\(completed) / \(files.count)"
-        if !enabled { status = "未启用"; detail = "基础搜索照常可用，可在下方配置模型" }
-        else if !loaded { status = "读取中"; detail = "正在读取已保存的进度" }
-        else if files.isEmpty { status = "无需处理"; detail = "当前没有需要此阶段处理的文件" }
-        else if active && remaining == 0 && !scan.userPaused {
-            status = "更新中"
-            detail = "已有结果可搜索，正在更新分析"
-        }
-        else if remaining == 0 {
-            status = failed > 0 ? "\(failed) 个待处理" : "已完成"
-            detail = "\(completed) 个完成" + (failed > 0 ? " · \(failed) 个失败，可查看原因" : "")
-        } else if scan.userPaused { detail = "剩余 \(remaining) 个 · 已暂停" }
-        else if scan.yieldingForSearch || resourcePause != nil {
-            detail = "剩余 \(remaining) 个 · " + (resourcePause ?? "搜索结束后继续")
-        } else if active {
-            let modelID = stage == "local" ? "" : (LocalQuickScan.isInstalled ? LocalQuickScan.model : GroqClient.scanModel)
-            let keys = pending.map { ScanTiming.key(stage: stage == "local" ? "local" : "deep", ext: $0.ext, model: modelID) }
-            let work = Dictionary(grouping: keys, by: { $0 }).mapValues(\.count)
-            detail = "剩余 \(remaining) 个 · " + ScanTiming.label(seconds: ScanTiming.remaining(work: work))
-        } else { detail = "剩余 \(remaining) 个 · 等待后台处理" }
-        if enabled, loaded, stage != "index", records.count > files.count {
-            detail += " · \(records.count - files.count) 个跳过"
-        }
+        var count = progress.count(stage, discovered: discovered)
+        count.running = count.running || active
+        let upstream = stage == "index" ? parsingPending
+            : parsingPending || (stage != "local" && !progress.count("local", discovered: discovered).settled)
+        let paused = scan.userPaused || (stage == deepStage && UserDefaults.standard.bool(forKey: ScanConfiguration.deepPausedKey))
+        let status = enabled ? count.status(upstreamPending: upstream, paused: paused, loaded: loaded) : "未启用"
+        let detail = !enabled ? "已有分析继续可搜索；不安排新的 8B 任务"
+            : (loaded ? count.summary + (upstream ? " · 上游仍在处理，数量持续更新" : "") : "正在统计当前文件版本")
         return IndexingStageDisplay(id: stage, title: title, symbol: symbol, detail: detail, status: status,
-            fraction: enabled && loaded && !files.isEmpty ? Double(completed + failed) / Double(files.count) : nil,
-            active: active && !scan.userPaused && scan.yieldingForSearch == false && resourcePause == nil,
-            attention: enabled && failed > 0)
+            fraction: enabled && loaded && count.total > 0 ? count.fraction : nil,
+            active: active && !paused && !scan.yieldingForSearch && resourcePause == nil,
+            attention: enabled && count.failed > 0)
     }
 
     private var semanticStage: IndexingStageDisplay {
-        var status = "准备中"
-        var detail = "让不同说法也能找到相关内容"
-        var fraction: Double?
+        var count = progress.semanticCount
+        count.running = semanticMatches && semantic.phase == .running
+        if semanticMatches && semantic.phase == .unavailable { count.failed = max(1, count.failed) }
+        let upstream = parsingPending || !progress.count("local", discovered: discovered).settled
+            || (deepEnabled && !UserDefaults.standard.bool(forKey: ScanConfiguration.deepPausedKey) && !progress.count(deepStage, discovered: discovered).settled)
         let enabled = ScanConfiguration.semanticEnabled()
-        if !enabled { status = "未启用"; detail = "全文搜索照常可用" }
-        else if semanticMatches {
-            if semantic.total > 0 { fraction = Double(semantic.ready) / Double(semantic.total) }
-            status = "\(semantic.ready.formatted()) / \(semantic.total.formatted()) 片段"
-            switch semantic.phase {
-            case .checking: status = "准备中"
-            case .running:
-                detail = scan.userPaused ? "已暂停，继续后处理剩余片段"
-                    : ScanTiming.label(seconds: ScanTiming.remaining(work: [semantic.timingKey: max(0, semantic.total - semantic.ready)]))
-            case .complete: status = semantic.total == 0 ? "无需处理" : "已完成"; detail = "\(semantic.ready.formatted()) 个内容片段可按含义搜索"
-            case .paused: detail = semantic.text
-            case .unavailable: status = "需检查"; detail = semantic.text
-            case .disabled: status = "未启用"; detail = "全文搜索照常可用"
-            }
-        }
-        return IndexingStageDisplay(id: "semantic", title: "语义搜索", symbol: "point.3.connected.trianglepath.dotted",
-            detail: detail, status: status, fraction: fraction,
-            active: enabled && semanticMatches && semantic.phase == .running && !scan.userPaused,
-            attention: enabled && semanticMatches && semantic.phase == .unavailable)
+        let status = enabled ? count.status(upstreamPending: upstream, paused: scan.userPaused, loaded: semanticLoaded) : "未启用"
+        let detail = enabled ? (semanticLoaded ? "Gemma 向量 \(count.ready) / \(count.total) · 待完成 \(count.pending)"
+            + (upstream ? "；上游仍在产生内容，分母会增长" : "；已完成部分可按含义搜索") : "正在统计 Gemma 向量目标") : "全文搜索照常可用"
+        return IndexingStageDisplay(id: "semantic", title: "语义索引", symbol: "point.3.connected.trianglepath.dotted",
+            detail: detail, status: status, fraction: enabled && semanticLoaded && count.total > 0 ? (upstream ? min(0.99, count.fraction) : count.fraction) : nil,
+            active: enabled && count.running && !scan.userPaused, attention: enabled && count.failed > 0)
     }
+
 }
 
 private struct ScanIssueDisplay: Identifiable {

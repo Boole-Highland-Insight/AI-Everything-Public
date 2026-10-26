@@ -1,4 +1,5 @@
 import Foundation
+import AIEData
 
 struct SearchRequestVersion: Equatable, Sendable {
     let generation: Int
@@ -12,6 +13,87 @@ struct SearchRequestVersion: Equatable, Sendable {
     func matches(generation currentGeneration: Int, query currentQuery: String) -> Bool {
         generation == currentGeneration
             && normalizedQuery == currentQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
+enum SearchResultMerge {
+    static func merge(lexical: [FileHit], semantic: [FileHit]) -> [FileHit] {
+        let semanticPaths = Set(semantic.map(\.path))
+        return semantic + lexical.filter { !semanticPaths.contains($0.path) }
+    }
+}
+
+enum DeepScanSearchEnhancement {
+    static let topNKey = "aie.search.enhancementTopN"
+    static let timeout: TimeInterval = 15
+    static var topN: Int {
+        let value = UserDefaults.standard.integer(forKey: topNKey)
+        return [3, 5, 10].contains(value) ? value : 5
+    }
+
+    struct Candidates {
+        let hits: [FileHit]
+        let summaries: [String: String]
+        let retrievalMilliseconds: Double
+        let fusionMilliseconds: Double
+    }
+
+    static func candidates(query: String, v1: [FileHit], semantic: [ChunkResult],
+                           files: [IndexedFile], roots: [String]) async throws -> Candidates {
+        try Task.checkCancellation()
+        let started = ProcessInfo.processInfo.systemUptime
+        let recall = ArchitectureAuditTrace.begin("deepscan_recall")
+        let deep = try await LocalSemanticIndex.shared.searchDeepScan(query: query, roots: roots, topK: 30)
+        recall?.end(count: deep.count)
+        let recalled = (ProcessInfo.processInfo.systemUptime - started) * 1000
+        try Task.checkCancellation()
+        let fusionStarted = ProcessInfo.processInfo.systemUptime
+        let fusion = ArchitectureAuditTrace.begin("enhancement_fusion")
+        let byPath = Dictionary(uniqueKeysWithValues: files.map { ($0.path, $0) })
+        let qualified = deep.filter {
+            $0.score >= 0.70 && byPath[$0.path]?.fileID == $0.fileID
+                && byPath[$0.path]?.versionID == $0.versionID
+        }
+        let checked = LibraryGateway.search(query: query, in: files, semantic: qualified,
+            limit: max(files.count, 30), acceptDeepScan: true)
+        let checkedByPath = Dictionary(uniqueKeysWithValues: checked.map { ($0.path, $0) })
+        var hits = Dictionary(uniqueKeysWithValues: v1.map { ($0.path, $0) })
+        var deepPaths: [String] = [], summaries: [String: String] = [:]
+        for chunk in qualified {
+            guard let file = byPath[chunk.path], var hit = checkedByPath[chunk.path] else { continue }
+            deepPaths.append(chunk.path)
+            summaries[chunk.path] = chunk.summary
+            guard hits[chunk.path] == nil else { continue }
+            if let source = semantic.first(where: { $0.path == chunk.path && $0.retrievalChannel == "raw_text" }),
+               let original = file.chunks.first(where: { $0.id == source.id && $0.kind != "document" && !EvidencePolicy.isModelDerived($0.kind) }) {
+                hit = EvidencePolicy.hit(file: file, chunk: original, query: query, reason: "DeepScan语义")
+                hit.evidence.append(.init(source: .body, strength: source.score, chunkID: original.id,
+                    page: original.page, startSeconds: original.startSeconds, endSeconds: original.endSeconds))
+            } else {
+                let checkedEvidence = hit.evidence, tier = hit.confidenceTier
+                hit = FileHit(path: file.path, name: file.name, relative: file.relative, kind: file.kind,
+                    ext: file.ext, mtime: file.mtime, reason: "DeepScan语义", score: hit.score,
+                    snippet: file.preview.isEmpty ? "文件信息 · " + file.name
+                        : "原文摘录 · " + String(file.preview.prefix(180)),
+                    highlights: [], thumbPath: file.thumbPath, uploadedToCloud: file.uploadedToCloud)
+                hit.evidence = checkedEvidence
+                hit.confidenceTier = tier
+            }
+            hit.evidence.append(.init(source: .summary, strength: chunk.score, chunkID: chunk.id, page: nil))
+            hits[chunk.path] = hit
+        }
+        let order = deepPaths.isEmpty ? Array(v1.prefix(30).map(\.path))
+            : RankFusion.fuse([v1.map(\.path), deepPaths], limit: 30)
+        let result = order.compactMap { hits[$0] }
+        fusion?.end(count: result.count, fields: [
+            "fingerprint": ContentIdentity.digest(result.map {
+                [$0.path, $0.chunkID ?? "", byPath[$0.path]?.versionID ?? "", summaries[$0.path] ?? ""].joined(separator: "\u{1f}")
+            }.joined(separator: "\u{1e}")),
+            "added_files": result.filter { hit in !v1.contains(where: { $0.path == hit.path }) }.count,
+            "qualified_deepscan": qualified.count,
+        ])
+        return Candidates(hits: result, summaries: summaries, retrievalMilliseconds: recalled,
+            fusionMilliseconds: (ProcessInfo.processInfo.systemUptime - fusionStarted) * 1000)
     }
 }
 
@@ -96,8 +178,8 @@ enum SearchRouter {
         if compiled.allowsUnfilteredBrowse {
             return .init(kind: .browse, routes: [.metadata])
         }
-        let namedExtension = query.normalized.range(
-            of: #"[^\s/\\]+\.[a-z0-9]{1,8}\b"#, options: .regularExpression
+        let namedExtension = compiled.ext != nil && query.normalized.range(
+            of: #"[^\s/\\.]+\.[a-z][a-z0-9]{0,7}\b"#, options: .regularExpression
         ) != nil
         if query.normalized.contains("/") || query.normalized.contains("\\") || namedExtension {
             return .init(kind: .locator, routes: [.metadata, .lexical])
@@ -141,6 +223,7 @@ enum SearchEvidenceSource: String, Codable, Hashable, Sendable {
     case identifier
     case summary
     case semantic
+    case visual
     case modelVerified
 }
 
@@ -221,8 +304,12 @@ final class SearchTraceSession: @unchecked Sendable {
 
     func record(_ name: String, startedAt: TimeInterval, candidates: Int) {
         let elapsed = max(0, (ProcessInfo.processInfo.systemUptime - startedAt) * 1000)
+        record(name, milliseconds: elapsed, candidates: candidates)
+    }
+
+    func record(_ name: String, milliseconds: Double, candidates: Int) {
         lock.lock()
-        stages.append(.init(name: name, milliseconds: elapsed, candidates: candidates))
+        stages.append(.init(name: name, milliseconds: max(0, milliseconds), candidates: candidates))
         lock.unlock()
     }
 
