@@ -55,8 +55,14 @@ private actor BGERerankProcess {
         process.standardInput = inputPipe
         process.standardOutput = outputPipe
         process.standardError = FileHandle.nullDevice
-        process.environment = ProcessInfo.processInfo.environment.merging(
-            ["HF_HOME": cache.path], uniquingKeysWith: { _, new in new }
+        var environment = ProcessInfo.processInfo.environment
+        environment.removeValue(forKey: "PYTHONHOME")
+        environment.removeValue(forKey: "PYTHONPATH")
+        process.environment = environment.merging(
+            ["HF_HOME": cache.path, "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1",
+             "PYTHONDONTWRITEBYTECODE": "1", "PYTHONNOUSERSITE": "1",
+             "AIE_BGE_MODEL_PATH": script.deletingLastPathComponent().appendingPathComponent("model").path],
+            uniquingKeysWith: { _, new in new }
         )
         do {
             try OwnedModelProcesses.run(process)
@@ -153,6 +159,17 @@ enum LocalBGERerank {
     }
 
     private static var runtime: Runtime? {
+        if let resources = Bundle.main.resourceURL {
+            let bundle = resources.appendingPathComponent("BGERuntime")
+            let python = bundle.appendingPathComponent("python/bin/python3")
+            let script = bundle.appendingPathComponent("local_bge_rerank.py")
+            if FileManager.default.isExecutableFile(atPath: python.path),
+               FileManager.default.fileExists(atPath: script.path),
+               FileManager.default.fileExists(atPath: bundle.appendingPathComponent("model/model.safetensors").path) {
+                return Runtime(python: python, script: script,
+                               cache: AIEApplicationPaths.support.appendingPathComponent("BGE/Cache"))
+            }
+        }
         var root = Bundle.main.bundleURL
         for _ in 0..<8 {
             let python = root.appendingPathComponent(".build/bge-reranker-env/bin/python")

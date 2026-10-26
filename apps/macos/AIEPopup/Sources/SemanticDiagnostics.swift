@@ -5,7 +5,8 @@ import AIEData
 enum SemanticDiagnostics {
     static func runIfRequested() -> Bool {
         if runDeepScanIfRequested() { return true }
-        guard CommandLine.arguments.dropFirst().first == "--verify-semantic" else { return false }
+        let enhancement = CommandLine.arguments.dropFirst().first == "--verify-local-enhancement"
+        guard enhancement || CommandLine.arguments.dropFirst().first == "--verify-semantic" else { return false }
         guard CommandLine.arguments.count == 3, let path = ProcessInfo.processInfo.environment["AIE_DATABASE_PATH"], path.hasPrefix("/") else { exit(2) }
         // Exercise the embedding-only plan without changing saved preferences or downloading models.
         UserDefaults.standard.setVolatileDomain([
@@ -45,7 +46,45 @@ enum SemanticDiagnostics {
                     guard hits.contains(where: { $0.name == expected && $0.chunkID != nil }) else { throw CocoaError(.coderInvalidValue) }
                     print("Semantic fixture passed: \(expected), cosine \(String(format: "%.3f", vectors[0].score))")
                 }
-                print("Real \(LocalSemanticIndex.usesGemma ? "Gemma" : "Qwen 0.6B") embedding checks passed; vision and local reranking disabled; no user documents or cloud APIs used.")
+                if enhancement {
+                    let file = files.first { $0.name == "onboarding.txt" }!
+                    let summary = "新员工入职流程：由人事办理登记和劳动合同签署，分配办公设备，并安排导师介绍团队。"
+                    let db = try AppDatabase.open()
+                    let revision = try await LocalGemmaWorker.shared.revision()
+                    let rawSpace = "gemma2:" + revision + ":raw-text-v1"
+                    let before = try db.embeddingCoverage(spaceID: rawSpace, rootPaths: [root.path],
+                        rawTextOnly: true, includeAllTextKinds: true)
+                    guard ScanRecords.mutate(file, { record in
+                        record["deepScan"] = ["blurb_zh": summary, "keywords_zh": ["入职流程"],
+                            "parse": ["sourceHash": file.contentHash!, "model": "qwen3-vl:8b-instruct-q4_K_M",
+                                      "parserVersion": "release-fixture-1"]]
+                        return true
+                    }) else { throw GemmaError.badResponse }
+                    let updated = LibraryGateway.load(roots: [root])
+                    // The normal update path must create the separate vectors; do not call indexDeepScan here.
+                    guard await LocalSemanticIndex.shared.indexNow(roots: [root.path]) else { throw GemmaError.badResponse }
+                    let deep = try await LocalSemanticIndex.shared.searchDeepScan(query: summary, roots: [root.path], topK: 30)
+                    guard deep.first?.fileID == file.fileID, (deep.first?.score ?? 0) >= 0.70 else { throw GemmaError.badResponse }
+                    let candidates = try await DeepScanSearchEnhancement.candidates(query: summary, v1: [],
+                        semantic: [], files: updated, roots: [root.path])
+                    guard candidates.hits.contains(where: { $0.path == file.path }), LocalBGERerank.isAvailable,
+                          let ranked = await LocalBGERerank.rerank(query: summary, hits: candidates.hits, files: updated,
+                            candidateLimit: DeepScanSearchEnhancement.topN, summaries: candidates.summaries),
+                          ranked.first?.path == file.path else { throw GemmaError.badResponse }
+                    let timedOut = await LocalBGERerank.rerank(query: summary, hits: ranked, files: updated, timeout: 0)
+                    guard timedOut == nil else { throw GemmaError.badResponse }
+                    let after = try db.embeddingCoverage(spaceID: rawSpace, rootPaths: [root.path],
+                        rawTextOnly: true, includeAllTextKinds: true)
+                    guard before.ready == after.ready, before.total == after.total else { throw GemmaError.badResponse }
+                    _ = await LocalSemanticIndex.shared.indexNow(roots: [root.path])
+                    let inputs = try db.deepScanEmbeddingInputs(spaceID: "gemma2:" + revision + ":deepscan-summary-v1",
+                        legacySpaceID: "gemma2:" + revision + ":understanding-v1", modelID: LocalGemmaWorker.modelID,
+                        modelVersion: revision, dimensions: 768, rootPaths: [root.path])
+                    guard inputs.count == 1, inputs.allSatisfy(\.indexed) else { throw GemmaError.badResponse }
+                    print("Release enhancement passed: automatic summary vector, independent recall, new candidate, bundled BGE Top5, timeout, idempotence, unchanged V1 coverage.")
+                }
+                await LocalGemmaWorker.shared.stop()
+                print("Real \(LocalSemanticIndex.usesGemma ? "Gemma" : "Qwen 0.6B") checks passed; no user documents or cloud APIs used.")
                 exit(0)
             } catch { fputs(error.localizedDescription + "\n", stderr); exit(1) }
         }

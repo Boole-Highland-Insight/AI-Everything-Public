@@ -46,7 +46,8 @@ struct APISettingsView: View {
     @State private var showUnderstandingFailures = false
     @State private var understandingSkipError: String?
     @State private var showQuality = false
-    @AppStorage("aie.search.automaticRerank") private var automaticRerank = false
+    @AppStorage("aie.search.automaticRerank") private var automaticRerank = true
+    @AppStorage("aie.search.cloudJev") private var cloudJev = false
     @State private var models: [APIConfiguration.Model: String] = Dictionary(
         uniqueKeysWithValues: APIConfiguration.Model.allCases.map { ($0, $0.id) }
     )
@@ -157,8 +158,13 @@ struct APISettingsView: View {
                     .controlSize(.small)
                 }
             }
-            Toggle("自动精排（BGE/Jev，会增加等待时间）", isOn: $automaticRerank)
+            Toggle("本地增强（DeepScan + BGE Top5）", isOn: $automaticRerank)
                 .font(.system(size: 11))
+                .disabled(cloudJev)
+            if !AIEApplicationPaths.isCleanV2 {
+                Toggle("改用云端 Jev（需 Key，会发送查询及候选内容）", isOn: $cloudJev)
+                    .font(.system(size: 11))
+            }
         }
     }
 

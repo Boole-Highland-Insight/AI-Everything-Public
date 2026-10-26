@@ -310,8 +310,8 @@ struct OnboardingView: View {
 
             VStack(alignment: .leading, spacing: 7) {
                 Text("填写后可使用：").font(.system(size: 12, weight: .medium))
-                Label("Jev 自动整理：搜索时判断候选是否真正相关", systemImage: "scope")
-                Label("候选整理：自动扩大范围，再由 Jev 判断可能结果", systemImage: "magnifyingglass.circle")
+                Label("Jev 云端精排：还需在设置中单独明确开启", systemImage: "scope")
+                Label("默认本地增强无需 Key，BGE 失败不会转云端", systemImage: "magnifyingglass.circle")
                 Label("咔哒：对你选中的文件生成新版本或补全内容", systemImage: "sparkles")
             }
             .font(.system(size: 12))
@@ -337,7 +337,7 @@ struct OnboardingView: View {
                 usageRow("输入", "文件名、关键词，或用一句话描述要找的内容")
                 usageRow("↑ ↓ 选择 · ↩ 打开", "选中结果后打开；PDF 和视频优先定位到命中位置")
                 usageRow("空格 · ⌘ ↩", "查看选中内容 · 在访达中显示原文件")
-                usageRow("输入框内 ↩", "确认当前搜索；可能结果会继续补充，并由 Jev 自动整理")
+                usageRow("输入框内 ↩", "确认当前搜索；DeepScan 与 BGE 在本机继续整理")
                 usageRow("Esc", "收起搜索；点击菜单栏 AIE 可再次打开")
             }
             Divider()

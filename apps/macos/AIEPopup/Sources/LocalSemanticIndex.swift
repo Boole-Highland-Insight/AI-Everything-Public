@@ -44,6 +44,7 @@ actor LocalSemanticIndex {
     private var roots: [String] = []
     private var job: Task<Void, Never>?
     private var generation = 0
+    private var updateRequested = false
     private var digest: String?
     private var queryCache: [String: [Float]] = [:]
     private var retryAfter = Date.distantPast
@@ -86,7 +87,8 @@ actor LocalSemanticIndex {
             Task { @MainActor in SemanticProgress.shared.phase = .disabled }
             return
         }
-        guard job == nil, force || Date() >= retryAfter else { return }
+        if job != nil { updateRequested = true; return }
+        guard force || Date() >= retryAfter else { return }
         let current = generation
         job = Task { await self.build(generation: current) }
     }
@@ -124,7 +126,15 @@ actor LocalSemanticIndex {
         try await LocalGemmaWorker.shared.text(texts, background: background)
     }
     private func build(generation current: Int) async {
-        defer { if current == generation { job = nil } }
+        defer {
+            if current == generation {
+                job = nil
+                if updateRequested {
+                    updateRequested = false
+                    update(roots: roots)
+                }
+            }
+        }
         do {
             let requested = roots
             await MainActor.run {
@@ -177,6 +187,9 @@ actor LocalSemanticIndex {
                     progress.phase = coverage.ready == coverage.total ? .complete : .running
                 }
                 if coverage.ready == coverage.total {
+                    if !ScanControl.shared.isPaused {
+                        _ = try await indexDeepScan(roots: requested, background: true)
+                    }
                     await MainActor.run { SemanticProgress.shared.revision += 1 }
                     return
                 }
@@ -354,8 +367,8 @@ actor LocalSemanticIndex {
         try await ensureModel()
     }
 
-    /// Explicit opt-in only: never scheduled by the V1 indexer or used by its search lanes.
-    func indexDeepScan(roots requested: [String]) async throws -> DeepScanIndexReport {
+    /// Separate summary channel, incrementally filled after ready V1 work. Never part of V1 recall.
+    func indexDeepScan(roots requested: [String], background: Bool = false) async throws -> DeepScanIndexReport {
         guard LocalGemmaWorker.isAvailable else { throw GemmaError.notInstalled }
         let revision = try await LocalGemmaWorker.shared.revision()
         let deepSpace = "gemma2:" + revision + ":deepscan-summary-v1"
@@ -381,18 +394,28 @@ actor LocalSemanticIndex {
         let missing = inputs.filter { !$0.indexed && $0.vector == nil }
         for offset in stride(from: 0, to: missing.count, by: 4) {
             try Task.checkCancellation()
+            while background && (ScanControl.shared.isInteractiveWorkActive || ScanControl.shared.isHeavyModelActive) {
+                try await Task.sleep(nanoseconds: 200_000_000)
+            }
+            if background && ScanControl.shared.isPaused { return DeepScanIndexReport(
+                space: deepSpace, total: inputs.count, generated: generated, reused: reused,
+                skipped: inputs.filter(\.indexed).count, failures: failures) }
             let batch = Array(missing[offset..<min(offset + 4, missing.count)])
             let texts = batch.map { input in
                 let evidence = ([input.chunk.summary] + input.chunk.tags).filter { !$0.isEmpty }
                 return "title: none | text: " + String(evidence.joined(separator: "\n").prefix(2400))
             }
             do {
-                let vectors = try await LocalGemmaWorker.shared.text(texts)
+                let vectors = try await LocalGemmaWorker.shared.text(texts, background: background)
                 for (input, vector) in zip(batch, vectors) {
                     do { try store(input.chunk, vector); generated += 1 }
                     catch { failures.append(input.chunk.path + ": " + String(describing: error)) }
                 }
             } catch is CancellationError { throw CancellationError() }
+            catch let error as URLError where background && error.code == .cancelled {
+                updateRequested = true
+                throw CancellationError()
+            }
             catch {
                 failures += batch.map { $0.chunk.path + ": " + String(describing: error) }
             }

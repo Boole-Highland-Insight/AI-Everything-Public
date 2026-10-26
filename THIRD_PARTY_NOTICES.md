@@ -8,3 +8,7 @@ AI Everything 使用或参考以下开源项目。各项目仍适用其原始许
 - [DigUp](https://github.com/ARahim3/DigUp)，MIT License。项目仅参考其索引交互和成本估算设计；保留的许可证见 [`apps/macos/AIEPopup/Resources/DigUp-LICENSE.txt`](apps/macos/AIEPopup/Resources/DigUp-LICENSE.txt)。
 
 AI Everything 自身使用仓库根目录的 [`LICENSE`](LICENSE)。
+
+- [BGE reranker v2 m3](https://huggingface.co/BAAI/bge-reranker-v2-m3)，Apache-2.0。固定原始模型提交 `953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e`；安装包存储 float16 权重，与 Apple Silicon MPS 推理精度一致。来源及校验值记录于包内 `BGERuntime/SOURCE.json`，模型许可证随包附带。
+- [Python Build Standalone](https://github.com/astral-sh/python-build-standalone)：固定 20261003 CPython 3.11.17 Apple Silicon 发行版，包含 CPython 及其原有许可证。
+- PyTorch（BSD-3-Clause）、Transformers（Apache-2.0）及其依赖用于本地 BGE 推理。固定依赖见 `tools/bge-requirements.txt`；各依赖许可证和完整版本清单位于安装包的 Python `site-packages` 与 `BGERuntime/SOURCE.json`。

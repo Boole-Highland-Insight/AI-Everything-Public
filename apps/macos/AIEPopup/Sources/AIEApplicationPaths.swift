@@ -15,6 +15,9 @@ enum AIEApplicationPaths {
     }
     static var ollamaHost: String { if Bundle.main.bundleIdentifier == "local.aieverything.cleanv2.progress" { return "127.0.0.1:11475" }; if Bundle.main.bundleIdentifier == "local.aieverything.cleanv2.deepcontrol" { return "127.0.0.1:11465" }; return isCleanV2 ? "127.0.0.1:11455" : (isCleanBaseline ? "127.0.0.1:11445" : "127.0.0.1:11435") }
     static func configure() {
+        UserDefaults.standard.register(defaults: ["aie.search.automaticRerank": true,
+                                                   DeepScanSearchEnhancement.topNKey: 5,
+                                                   "aie.search.cloudJev": false])
         guard isCleanBaseline else { return }
         if let path = ProcessInfo.processInfo.environment["AIE_DATABASE_PATH"] {
             let target = URL(fileURLWithPath: path).resolvingSymlinksInPath().standardizedFileURL.path

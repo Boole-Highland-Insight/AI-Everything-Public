@@ -9,7 +9,7 @@ bash apps/macos/AIEPopup/build.sh
 open "apps/macos/AIEPopup/build/AI Everything.app"
 ```
 
-首次构建下载锁定的 GRDB 7.11.1，并从官方 `ggml-org/llama.cpp` 的固定提交编译 Gemma 运行时。Gemma 2 Q8_0 文字模型和 mmproj 从官方 `ggml-org/embeddinggemma-2-GGUF` 下载、校验 SHA256 后随 App 打包。若本机 AIE 的 `~/Library/Application Support/AI Everything/Semantic/models` 已有校验通过的文件，会直接复用；构建和运行均不依赖 DigUp。可用 `AIE_GEMMA_MODELS_SOURCE`、`AIE_LLAMA_CPP_SOURCE` 和 `AIE_CMAKE_PATH` 指定构建输入。完整 App 约 859 MB。Release 会映射源路径并剥离调试符号，避免附带本机构建路径。
+首次构建下载锁定的 GRDB 7.11.1，并从官方 `ggml-org/llama.cpp` 的固定提交编译 Gemma 运行时。Gemma 2 Q8_0 文字模型和 mmproj 从官方 `ggml-org/embeddinggemma-2-GGUF` 下载、校验 SHA256 后随 App 打包。若本机 AIE 的 `~/Library/Application Support/AI Everything/Semantic/models` 已有校验通过的文件，会直接复用；构建和运行均不依赖 DigUp。可用 `AIE_GEMMA_MODELS_SOURCE`、`AIE_LLAMA_CPP_SOURCE` 和 `AIE_CMAKE_PATH` 指定构建输入。构建同时使用 `tools/build_bge_runtime.py` 打包固定的便携 Python、PyTorch、Transformers 和 BGE float16 模型；普通用户不需要自行安装 Python、pip 或开发工具。模型来源及 SHA256 记录于包内 `BGERuntime/SOURCE.json`。安装包体积包含全部本地搜索模型。Release 会映射源路径并剥离调试符号，避免附带本机构建路径。
 
 默认构建当前架构。Intel 交叉编译：
 
@@ -76,3 +76,7 @@ git diff --check
 ```
 
 密钥扫描只是检查的一部分；还需人工查看文档、素材、夹具、归档成员和提交元数据。不要上传本机数据库、API Key、真实用户截图、模型缓存或个人日志。调试日志默认关闭，只有设置 `AIE_DEBUG_LOGS=1` 才启用。
+
+## 本地增强验收
+
+`AIE_DATABASE_PATH` 指向新的临时库、`CFFIXED_USER_HOME` 指向临时用户目录时，可对空的合成资料目录运行 `AIEPopup --verify-local-enhancement /tmp/fixture`。该检查验证基础 Gemma 召回、有效 8B 记录自动生成独立向量、DeepScan 补充候选、BGE、超时回退与幂等；不会运行 8B 或读取真实文件。真实 8B 扫描完成后沿用相同的重载与增量索引入口。

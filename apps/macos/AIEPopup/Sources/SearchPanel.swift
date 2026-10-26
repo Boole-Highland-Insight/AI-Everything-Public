@@ -800,10 +800,14 @@ final class SearchModel: ObservableObject {
     }
 
     var jevReady: Bool {
-        UserDefaults.standard.bool(forKey: "aie.search.automaticRerank")
-            && (LocalBGERerank.isAvailable || (!AIEApplicationPaths.isCleanV2 && (JevRerank.usesLocalEndpoint || JevRerank.hasKey)))
+        if cloudJevOptIn { return JevRerank.usesLocalEndpoint || JevRerank.hasKey }
+        return UserDefaults.standard.bool(forKey: "aie.search.automaticRerank")
+            && LocalBGERerank.isAvailable
     }
-    private var automaticRerankerName: String { LocalBGERerank.isAvailable ? "BGE" : "Jev" }
+    private var cloudJevOptIn: Bool {
+        !AIEApplicationPaths.isCleanV2 && UserDefaults.standard.bool(forKey: "aie.search.cloudJev")
+    }
+    private var automaticRerankerName: String { cloudJevOptIn ? "Jev" : "BGE" }
 
     /// Search is live and Jev automatically refines settled queries. Return only commits the query.
     @MainActor
@@ -824,7 +828,7 @@ final class SearchModel: ObservableObject {
 
     private func scheduleRerank(query q: String, local: [FileHit], wideSemantic: [ChunkResult], trace: SearchTraceSession) {
         let routing = SearchRouter.route(q)
-        let localOnly = AIEApplicationPaths.isCleanV2
+        let localOnly = !cloudJevOptIn
         guard localOnly ? jevReady
               : (routing.uses(.semantic) && (jevReady || (remoteReady && APIConfiguration.cloudRerankEnabled))) else {
             searchProgress = nil
@@ -1017,14 +1021,17 @@ final class SearchModel: ObservableObject {
             ArchitectureAuditTrace.event("rerank_cache_hit", count: candidates.count)
             return (automaticJevHits, nil, automaticRerankerWasBGE)
         }
-        if let ranked = await LocalBGERerank.rerank(query: query, hits: candidates, files: files) {
+        if !cloudJevOptIn {
+            guard let ranked = await LocalBGERerank.rerank(query: query, hits: candidates, files: files,
+                                                        candidateLimit: DeepScanSearchEnhancement.topN) else {
+                return (candidates, nil, false)
+            }
             automaticJevSignature = signature
             automaticJevHits = ranked
             automaticRerankerWasBGE = true
             return (ranked, nil, true)
         }
-        // A local test build never falls back to an external reranker implicitly.
-        if AIEApplicationPaths.isCleanV2 { return (candidates, nil, false) }
+        // Cloud ranking is a separate, explicit choice, never a BGE failure fallback.
         let outcome = await JevRerank.rerank(
             query: query, hits: candidates, files: files, dropSeriouslyIrrelevant: true)
         if outcome.requests > 0 && outcome.errors < outcome.requests {
@@ -1037,7 +1044,7 @@ final class SearchModel: ObservableObject {
 
     private func automaticRerankerNote(_ outcome: JevRerank.Outcome?, usedBGE: Bool) -> String {
         if usedBGE { return " · BGE 已整理" }
-        if AIEApplicationPaths.isCleanV2 { return " · 保留原排序（BGE 未完成）" }
+        if !cloudJevOptIn { return " · 保留原排序（BGE 未完成）" }
         guard let outcome else { return " · Jev 已整理" }
         if outcome.requests == 0 {
             return " · " + (JevRerank.lastError ?? "Jev 没有返回判断")

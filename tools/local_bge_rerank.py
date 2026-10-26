@@ -12,7 +12,8 @@ from transformers import AutoModelForSequenceClassification, AutoTokenizer
 audit_path = os.environ.get("AIE_AUDIT_TRACE_PATH", "")
 audit = audit_path.startswith(("/tmp/", "/private/tmp/"))
 load_started = time.monotonic()
-model_id = "BAAI/bge-reranker-v2-m3"
+bundled_model = os.environ.get("AIE_BGE_MODEL_PATH", "")
+model_id = bundled_model if os.path.isfile(os.path.join(bundled_model, "config.json")) else "BAAI/bge-reranker-v2-m3"
 device = "mps" if torch.backends.mps.is_available() else "cpu"
 dtype = torch.float16 if device == "mps" else torch.float32
 tokenizer = AutoTokenizer.from_pretrained(model_id, local_files_only=True)

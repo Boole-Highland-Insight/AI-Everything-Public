@@ -32,8 +32,8 @@ struct DeviceProfile {
             os: ProcessInfo.processInfo.operatingSystemVersionString)
     }
     var reason: String {
-        if !appleSilicon { return "Intel 使用 CPU 推理，4B / 8B 扫描可能较慢。可以选择仅使用 0.6B 的语义索引。" }
+        if !appleSilicon { return "Intel 使用 CPU 推理，4B / 8B 扫描可能较慢。可选择仅使用 Gemma 的语义索引。" }
         if memoryGiB < 16 { return "内存较少，建议选择语义索引以减少后台占用。三档模型均在本机运行。" }
-        return "三档模型均在本机运行。8B 是默认推荐；想减少后台占用，可以选择 4B 或仅使用 0.6B。"
+        return "三档模型均在本机运行。8B 是默认推荐；想减少后台占用，可以选择 4B 或仅使用 Gemma。"
     }
 }

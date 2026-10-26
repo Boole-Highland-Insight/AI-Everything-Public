@@ -36,6 +36,9 @@ done
 cp "$ROOT/build/spm/checkouts/GRDB.swift/LICENSE" "$APP/Contents/Resources/GRDB-LICENSE.txt"
 
 cp "$ROOT/Info.plist" "$APP/Contents/Info.plist"
+SOURCE_REVISION="$(git -C "$PROJECT" rev-parse HEAD)"
+if ! git -C "$PROJECT" diff --quiet; then SOURCE_REVISION="$SOURCE_REVISION-dirty"; fi
+/usr/libexec/PlistBuddy -c "Add :AIESourceRevision string $SOURCE_REVISION" "$APP/Contents/Info.plist"
 if [ -n "${AIE_VERSION:-}" ]; then
   /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $AIE_VERSION" "$APP/Contents/Info.plist"
 fi
@@ -51,6 +54,7 @@ cp "$GEMMA_MODELS_SOURCE/mmproj-embeddinggemma-2-Q8_0.gguf" "$APP/Contents/Resou
 cp "$ROOT/Resources/EmbeddingGemma2-SOURCE.txt" "$APP/Contents/Resources/GemmaModels/"
 cp "$ROOT/Resources/EmbeddingGemma2-APACHE-2.0.txt" "$APP/Contents/Resources/GemmaModels/"
 bash "$PROJECT/tools/build_gemma_runtime.sh" "$APP/Contents/Resources/GemmaRuntime"
+python3 "$PROJECT/tools/build_bge_runtime.py" "$APP/Contents/Resources/BGERuntime"
 cp "$ROOT/Resources/OnboardingDemo-"*.mp4 "$ROOT/Resources/OnboardingDemo-"*.png "$APP/Contents/Resources/"
 cp "$PROJECT/tools/setup_local_quickscan.sh" "$APP/Contents/Resources/"
 cp "$PROJECT/tools/setup_local_semantic.sh" "$APP/Contents/Resources/"
@@ -58,9 +62,15 @@ cp "$PROJECT/tools/pull_local_model.py" "$APP/Contents/Resources/"
 if [ -n "${AIE_SIGN_IDENTITY:-}" ]; then
   while IFS= read -r -d '' FILE; do
     codesign --force --options runtime --timestamp --sign "$AIE_SIGN_IDENTITY" "$FILE"
+  done < <(find "$APP/Contents/Resources/BGERuntime" -type f \( -name '*.dylib' -o -name '*.so' -o -name 'python3.11' -o -name 'torch_shm_manager' -o -name 'protoc' \) -print0)
+  while IFS= read -r -d '' FILE; do
+    codesign --force --options runtime --timestamp --sign "$AIE_SIGN_IDENTITY" "$FILE"
   done < <(find "$APP/Contents/Resources/GemmaRuntime" -type f \( -name '*.dylib' -o -name 'llama-server' \) -print0)
   codesign --force --options runtime --timestamp --sign "$AIE_SIGN_IDENTITY" "$APP"
 else
+  while IFS= read -r -d '' FILE; do
+    codesign --force --sign - "$FILE" >/dev/null 2>&1
+  done < <(find "$APP/Contents/Resources/BGERuntime" -type f \( -name '*.dylib' -o -name '*.so' -o -name 'python3.11' -o -name 'torch_shm_manager' -o -name 'protoc' \) -print0)
   while IFS= read -r -d '' FILE; do
     codesign --force --sign - "$FILE" >/dev/null
   done < <(find "$APP/Contents/Resources/GemmaRuntime" -type f \( -name '*.dylib' -o -name 'llama-server' \) -print0)

@@ -20,7 +20,7 @@ macOS 14+ · Apple Silicon · 中文界面 · MIT 开源
 
 </div>
 
-> 当前为 **v0.1.0**。DMG 尚未获得 Developer ID 签名和 Apple 公证，首次打开可能被 macOS 拦截，请先阅读[安装指南](docs/INSTALL.md)。EmbeddingGemma 2 向量模型随 App 附带；Qwen3-VL 内容理解模型按所选方案单独下载。本机搜索无需注册账号，也无需 API Key。
+> 当前为 **v0.1.0**。DMG 尚未获得 Developer ID 签名和 Apple 公证，首次打开可能被 macOS 拦截，请先阅读[安装指南](docs/INSTALL.md)。EmbeddingGemma 2、离线 BGE 模型及运行环境随 App 附带；Qwen3-VL 内容理解模型按所选方案单独下载。本机搜索无需注册账号，也无需 API Key。
 
 ## 记得内容就够了
 
@@ -29,7 +29,8 @@ macOS 14+ · Apple Silicon · 中文界面 · MIT 开源
 - **找到具体位置。** 结果可显示命中片段、PDF / PPTX 页码，以及已索引音视频的时间点。视频可从对应位置播放。
 - **按一下就出现。** `⌥ Space` 唤起搜索，`Return` 打开，`Space` 预览，`⌘ Return` 在 Finder 中定位。
 - **结果分层显示。** 文件名、正文与语义检索的结果合并后分为直接命中与可能相关，并标注命中依据。
-- **可选自动精排。** 默认关闭。在设置中开启「自动精排」并配置 OpenRouter Key 后，Jev 会对本机已检索出的候选重新判断排序；云端会收到查询与候选片段，详见[隐私边界](docs/PRIVACY.md)。
+- **先显示，再本地增强。** FTS5＋Gemma＋RRF 先发布首屏；随后已有 8B 摘要向量补充召回，本地 BGE 重排 Top5，一次发布增强结果。默认开启，无需 Key；失败保留首屏。
+- **云端明确选择。** Jev 默认关闭，只有单独选择「改用云端 Jev」并配置 Key 才会发送查询与候选内容。BGE 失败不会自动转云端，详见[隐私边界](docs/PRIVACY.md)。
 
 ## 让后台慢慢做，让你继续工作
 
@@ -75,7 +76,7 @@ macOS 14+ · Apple Silicon · 中文界面 · MIT 开源
 | 操作 | 在哪里处理 |
 |---|---|
 | 文件名 / 正文检索、系统 OCR、本机向量与已安装的本机理解模型 | 本机 |
-| 开启「自动精排」并配置 Key 后的 Jev 搜索判断 | 云端：查询、候选相对路径及命中片段 |
+| 明确选择「改用云端 Jev」并配置 Key 后的搜索判断 | 云端：查询、候选相对路径及命中片段 |
 | 主动点击「咔哒一下」与后续修改 | 云端：所选文件内容、要求和必要的版本内容 |
 
 新手引导选择本机方案后，后台扫描不会自动回退云端。无需云端功能时不填 Key 即可。模型下载需要网络；云端服务适用其各自的数据政策。
@@ -93,7 +94,7 @@ bash apps/macos/AIEPopup/build.sh
 open "apps/macos/AIEPopup/build/AI Everything.app"
 ```
 
-构建需要 Swift 6.1+、CMake 与 macOS SDK；首次构建会编译固定版本的 llama.cpp 并下载约 860 MB 模型，完整 App 约 859 MB。下载版运行不需要安装开发工具。预编译 DMG 目前提供 Apple Silicon 版，Intel 可尝试源码构建，尚未在 Intel 实机验收。
+构建需要 Swift 6.1+、CMake 与 macOS SDK；首次构建会编译固定版本的 llama.cpp，并下载 Gemma、便携 Python 和 BGE 模型；模型会随 App 打包。下载版运行不需要安装开发工具。本次完整安装包仅支持 Apple Silicon；Intel 的完整 BGE 依赖打包尚未支持。
 
 - [开发与验证](docs/DEVELOPMENT.md) · [贡献指南](CONTRIBUTING.md)
 - [反馈问题](https://github.com/Boole-Highland-Insight/AI-Everything-Public/issues) · [安全问题私下报告](SECURITY.md)
