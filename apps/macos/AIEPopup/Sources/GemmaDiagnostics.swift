@@ -166,8 +166,8 @@ enum GemmaDiagnostics {
             && environment["AIE_DATABASE_PATH"] == AIEApplicationPaths.support.appendingPathComponent("Index/content.sqlite").path
         guard args.count == 5,
               environment["AIE_DATABASE_PATH"]?.hasPrefix("/tmp/") == true || live else { exit(2) }
-        let roots = live && args[2] == "--current-roots" ? LibraryRoots.load()
-            : [URL(fileURLWithPath: args[2]).standardizedFileURL]
+        let roots = (live && args[2] == "--current-roots" ? LibraryRoots.load()
+            : [URL(fileURLWithPath: args[2])]).map { $0.standardizedFileURL.resolvingSymlinksInPath() }
         guard !roots.isEmpty else { exit(2) }
         let rootPaths = roots.map(\.path)
         let input = URL(fileURLWithPath: args[3])
@@ -184,10 +184,9 @@ enum GemmaDiagnostics {
         Task { @MainActor in
             do {
                 let queries = try JSONDecoder().decode([String].self, from: Data(contentsOf: input))
-                let model = SearchModel()
-                model.roots = roots
-                model.files = LibraryGateway.load(roots: roots)
+                let indexed = LibraryGateway.load(roots: roots)
                 guard LibraryGateway.lastError == nil else { throw GemmaError.badResponse }
+                let model = SearchModel(indexedFiles: indexed, roots: roots)
                 var window: NSWindow?
                 if auditEnvironment["AIE_AUDIT_RENDER"] == "1" {
                     let panel = NSWindow(contentRect: NSRect(x: 80, y: 80, width: 620, height: 500),
